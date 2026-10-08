@@ -1,5 +1,6 @@
 #include "rafty/raft.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -23,6 +24,17 @@ uint64_t mix_seed(uint64_t seed, NodeId id) {
   return seed * 0x9E3779B97F4A7C15ULL + id;
 }
 
+// A broken safety invariant means the algorithm is wrong; continuing would
+// corrupt data. Fail loudly so tests cannot miss it.
+[[noreturn]] void fatal(const char* what, NodeId self, uint64_t a,
+                        uint64_t b) {
+  std::fprintf(stderr, "FATAL on node %llu: %s (%llu, %llu)\n",
+               static_cast<unsigned long long>(self), what,
+               static_cast<unsigned long long>(a),
+               static_cast<unsigned long long>(b));
+  std::abort();
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -37,7 +49,10 @@ Raft::Raft(Config cfg, Transport& transport, Storage& storage,
       clock_(clock),
       rng_(mix_seed(cfg_.seed, cfg_.id)) {
   // Restart recovery: term and vote come back from durable storage, so a
-  // restarted node cannot vote twice in a term it already voted in.
+  // restarted node cannot vote twice in a term it already voted in. The log
+  // is read from storage on demand. commit_index_ and last_applied_ start at
+  // 0: the state machine is rebuilt by re-applying committed entries as the
+  // leader re-announces its commit index.
   hs_ = storage_.load_hard_state();
   // Every node starts as a follower, even one that was leader before a crash.
   become_follower(hs_.current_term, kNoNode);
@@ -52,7 +67,7 @@ void Raft::tick() {
 
   if (role_ == Role::Leader) {
     if (now >= next_heartbeat_) {
-      broadcast_heartbeat();
+      broadcast_append();  // heartbeat, plus any entries a follower is missing
       next_heartbeat_ = now + cfg_.heartbeat_interval;
     }
     if (cfg_.check_quorum && now >= next_quorum_check_) {
@@ -88,6 +103,24 @@ void Raft::step(const Message& msg) {
           },
       },
       msg.payload);
+}
+
+std::optional<Index> Raft::propose(std::string data) {
+  if (role_ != Role::Leader) return std::nullopt;
+  append_to_own_log(EntryType::Normal, std::move(data));
+  const Index index = last_log_index();
+  broadcast_append();
+  maybe_advance_commit();  // single-node cluster commits immediately
+  return index;
+}
+
+std::vector<LogEntry> Raft::take_committed() {
+  if (last_applied_ >= commit_index_) return {};
+  // Only committed entries are handed out, so the state machine never sees
+  // an entry that could later be truncated (State Machine Safety).
+  auto out = storage_.entries(last_applied_ + 1, commit_index_ + 1);
+  last_applied_ = commit_index_;
+  return out;
 }
 
 // ===========================================================================
@@ -144,14 +177,28 @@ void Raft::become_leader() {
   votes_.clear();
   last_ack_.clear();
 
-  // Announce leadership right away so other candidates step down quickly.
-  broadcast_heartbeat();
+  // Optimistic start: assume every follower matches our whole log. Wrong
+  // guesses are fixed by rejections. match starts at 0 because nothing is
+  // PROVEN replicated yet, and commit decisions use only match.
+  progress_.clear();
+  for (NodeId peer : cfg_.peers) {
+    progress_[peer] = Progress{last_log_index() + 1, 0};
+  }
+
+  // No-op in our own term (Raft thesis 6.4). The commit rule only lets a
+  // leader commit entries from its current term, so without this, entries
+  // left over from earlier terms could stay uncommitted until a client
+  // happened to write.
+  append_to_own_log(EntryType::NoOp, "");
+
+  broadcast_append();  // also announces leadership
   next_heartbeat_ = now + cfg_.heartbeat_interval;
   next_quorum_check_ = now + cfg_.election_timeout_max;
+  maybe_advance_commit();  // single-node cluster
 }
 
 // ===========================================================================
-// Message handlers
+// Message handlers: elections
 // ===========================================================================
 
 void Raft::handle_request_vote(NodeId from, const RequestVoteReq& req) {
@@ -192,6 +239,8 @@ void Raft::handle_request_vote(NodeId from, const RequestVoteReq& req) {
 
   // Election Safety: at most one vote per term. Re-granting to the same
   // candidate is fine (its first reply may have been lost).
+  // Leader Completeness: only vote for a log at least as up to date as ours,
+  // so a winner always holds every committed entry.
   const bool can_vote =
       hs_.voted_for == kNoNode || hs_.voted_for == req.candidate_id;
   const bool grant =
@@ -237,30 +286,86 @@ void Raft::handle_request_vote_resp(NodeId from,
   }
 }
 
+// ===========================================================================
+// Message handlers: replication
+// ===========================================================================
+
 void Raft::handle_append_entries(NodeId from, const AppendEntriesReq& req) {
+  auto reject = [&] {
+    AppendEntriesResp r;
+    r.term = hs_.current_term;
+    r.success = false;
+    r.rejected_index = req.prev_log_index;
+    r.last_log_index = last_log_index();
+    send(from, r);
+  };
+
   // Term rule: a stale leader learns our term from the rejection and steps
   // down.
   if (req.term < hs_.current_term) {
-    send(from, AppendEntriesResp{hs_.current_term, false});
+    reject();
     return;
   }
 
   // Election Safety check: two leaders in the same term must be impossible.
-  // If this ever fires, the voting logic is broken, so fail loudly.
   if (role_ == Role::Leader && req.term == hs_.current_term) {
-    std::fprintf(stderr,
-                 "FATAL: election safety violated: nodes %llu and %llu both "
-                 "lead term %llu\n",
-                 static_cast<unsigned long long>(cfg_.id),
-                 static_cast<unsigned long long>(from),
-                 static_cast<unsigned long long>(req.term));
-    std::abort();
+    fatal("election safety violated: two leaders in one term", cfg_.id,
+          from, req.term);
   }
 
   // A valid leader exists for term >= ours. Candidates and pre-candidates in
   // this term lost the election; everyone resets their election timer.
   become_follower(req.term, from);
-  send(from, AppendEntriesResp{hs_.current_term, true});
+
+  // Log Matching consistency check: we must hold the entry the new entries
+  // follow. If not, reject; the leader will back up and retry.
+  if (req.prev_log_index > last_log_index() ||
+      storage_.term_at(req.prev_log_index) != req.prev_log_term) {
+    reject();
+    return;
+  }
+
+  const Index last_new = merge_entries(req);  // durable before the ack below
+
+  // Commit rule (follower side): commit up to what the leader says, but no
+  // further than the entries THIS message proved match the leader. Anything
+  // past last_new may be stale entries from an old term. commit_index_
+  // never decreases, even if this message is old.
+  const Index new_commit = std::min(req.leader_commit, last_new);
+  if (new_commit > commit_index_) commit_index_ = new_commit;
+
+  AppendEntriesResp ok;
+  ok.term = hs_.current_term;
+  ok.success = true;
+  ok.match_index = last_new;
+  send(from, ok);
+}
+
+Index Raft::merge_entries(const AppendEntriesReq& req) {
+  const auto& in = req.entries;
+  for (std::size_t i = 0; i < in.size(); ++i) {
+    const Index idx = in[i].index;
+
+    if (idx <= last_log_index()) {
+      // Already have an entry here. Same term means same entry (Log
+      // Matching), so skip it. This is what stops a delayed or duplicated
+      // AppendEntries from truncating entries that arrived after it.
+      if (storage_.term_at(idx) == in[i].term) continue;
+
+      // Real conflict: our entry came from a leader that lost. Committed
+      // entries can never conflict (Leader Completeness); if one does, the
+      // algorithm is broken.
+      if (idx <= commit_index_) {
+        fatal("conflict at a committed index", cfg_.id, idx, commit_index_);
+      }
+      storage_.truncate_from(idx);
+    }
+
+    // Everything from i on is new: append it in one durable write.
+    storage_.append({in.begin() + static_cast<long>(i), in.end()});
+    break;
+  }
+  return req.prev_log_index + in.size();
 }
 
 void Raft::handle_append_entries_resp(NodeId from,
@@ -270,28 +375,103 @@ void Raft::handle_append_entries_resp(NodeId from,
     become_follower(resp.term, kNoNode);
     return;
   }
-  if (role_ != Role::Leader) return;
+  // Ignore replies from older terms and anything after we stopped leading.
+  if (role_ != Role::Leader || resp.term != hs_.current_term) return;
+
   last_ack_[from] = clock_.now();  // proof this peer is reachable
+  Progress& p = progress_[from];
+
+  if (resp.success) {
+    // match_index is absolute, so out-of-order replies are safe: keep max.
+    if (resp.match_index > p.match) {
+      p.match = resp.match_index;
+      p.next = std::max(p.next, p.match + 1);
+      maybe_advance_commit();
+      // Still behind? Keep streaming instead of waiting for the heartbeat.
+      if (p.next <= last_log_index()) send_append(from);
+    }
+    return;
+  }
+
+  // Rejection. Ignore it unless it answers the probe we are making now;
+  // a stale rejection would otherwise push next backwards for nothing.
+  if (resp.rejected_index != p.next - 1) return;
+
+  // Back up. Jump straight past the follower's last entry if it is far
+  // behind, but never below what we already know matches.
+  p.next = std::min(p.next - 1, resp.last_log_index + 1);
+  p.next = std::max(p.next, p.match + 1);
+  send_append(from);
 }
 
 // ===========================================================================
-// Helpers
+// Replication helpers
+// ===========================================================================
+
+void Raft::append_to_own_log(EntryType type, std::string data) {
+  // Leader Append-Only: a leader only ever adds to the end of its log.
+  LogEntry e;
+  e.term = hs_.current_term;
+  e.index = last_log_index() + 1;
+  e.type = type;
+  e.data = std::move(data);
+  storage_.append({std::move(e)});  // durable before anyone is told about it
+}
+
+void Raft::send_append(NodeId peer) {
+  Progress& p = progress_[peer];
+  const Index last = last_log_index();
+  p.next = std::min(p.next, last + 1);
+
+  AppendEntriesReq req;
+  req.term = hs_.current_term;
+  req.leader_id = cfg_.id;
+  req.prev_log_index = p.next - 1;
+  req.prev_log_term = storage_.term_at(req.prev_log_index);
+  const Index hi = std::min<Index>(last + 1, p.next + cfg_.max_entries_per_msg);
+  if (p.next < hi) req.entries = storage_.entries(p.next, hi);
+  req.leader_commit = commit_index_;
+  send(peer, std::move(req));
+}
+
+void Raft::broadcast_append() {
+  for (NodeId peer : cfg_.peers) send_append(peer);
+}
+
+void Raft::maybe_advance_commit() {
+  if (role_ != Role::Leader) return;
+
+  // Commit rule (Raft 5.4.2): commit N only if a majority stores N AND
+  // log[N].term == currentTerm. Counting replicas of an OLDER-term entry is
+  // not enough: that entry can still be overwritten by a later leader (the
+  // paper's Figure 8). Older entries commit implicitly once a current-term
+  // entry after them commits.
+  //
+  // Terms in a log never decrease, so scan down from the end and stop at the
+  // first entry from an older term.
+  for (Index n = last_log_index(); n > commit_index_; --n) {
+    if (storage_.term_at(n) != hs_.current_term) break;
+    std::size_t replicas = 1;  // ourselves: the leader's log has n
+    for (const auto& [peer, p] : progress_) {
+      if (p.match >= n) ++replicas;
+    }
+    if (replicas >= quorum()) {
+      commit_index_ = n;
+      return;
+    }
+  }
+}
+
+// ===========================================================================
+// Election helpers
 // ===========================================================================
 
 void Raft::broadcast_request_vote(bool pre_vote) {
   // Pre-vote asks about the term we WOULD use; a real vote uses our new term.
   const Term term = pre_vote ? hs_.current_term + 1 : hs_.current_term;
-  // Step 1: the log is empty, so last index and term are 0. Step 2 fills
-  // these from the real log.
   for (NodeId peer : cfg_.peers) {
-    send(peer, RequestVoteReq{term, cfg_.id, /*last_log_index=*/0,
-                              /*last_log_term=*/0, pre_vote});
-  }
-}
-
-void Raft::broadcast_heartbeat() {
-  for (NodeId peer : cfg_.peers) {
-    send(peer, AppendEntriesReq{hs_.current_term, cfg_.id});
+    send(peer, RequestVoteReq{term, cfg_.id, last_log_index(), last_log_term(),
+                              pre_vote});
   }
 }
 
@@ -337,12 +517,11 @@ void Raft::check_quorum() {
 }
 
 bool Raft::candidate_log_up_to_date(Index last_index, Term last_term) const {
-  // Raft 5.4.1: compare last log terms first, then lengths.
-  // Step 1: our log is empty (index 0, term 0), so every candidate passes.
-  constexpr Index kMyLastIndex = 0;
-  constexpr Term kMyLastTerm = 0;
-  if (last_term != kMyLastTerm) return last_term > kMyLastTerm;
-  return last_index >= kMyLastIndex;
+  // Raft 5.4.1: the log whose last entry has the higher term is more up to
+  // date; if the terms are equal, the longer log is.
+  const Term my_term = last_log_term();
+  if (last_term != my_term) return last_term > my_term;
+  return last_index >= last_log_index();
 }
 
 }  // namespace rafty

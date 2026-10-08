@@ -1,6 +1,45 @@
+# ---- Build output ----
+# build/, build-asan/, build-tsan/, build-release/, ... and CLion's dirs
 build/
-.cache/
+build-*/
+cmake-build-*/
 compile_commands.json
-.DS_Store
+CMakeUserPresets.json
+Testing/
+
+# Compiled artifacts (in case anything is built outside build dirs)
+*.o
+*.a
+*.dylib
+*.so
+*.dSYM/
+
+# ---- Runtime data from running nodes and tests ----
+# WAL segments, snapshots, per-node data dirs (step 3+)
 *.wal
 *.snap
+data/
+# Client call/return histories from chaos runs (step 6); keep only curated
+# examples under unittests/ if needed
+*.history
+# Crash dumps
+core
+core.*
+
+# ---- Benchmarks ----
+# bench/results/*.json and bench/plots/ ARE committed (they back the README).
+# Ignore scratch output and Python caches from plotting scripts.
+bench/tmp/
+__pycache__/
+*.pyc
+.venv/
+
+# ---- Tools and editors ----
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- OS ----
+.DS_Store

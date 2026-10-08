@@ -42,11 +42,6 @@ elseif(NOT SANITIZE STREQUAL "")
 endif()
 
 # ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-enable_testing()
-
-# ---------------------------------------------------------------------------
 # Targets are added one build step at a time:
 #   Step 1-3: rafty core library (raft.cpp, storage.cpp). Depends on NO
 #             networking library: raft talks only to Transport/Storage/Clock
@@ -55,3 +50,39 @@ enable_testing()
 #   Step 4+:  protobuf + gRPC (find_package) for kv_server, kv_client, apps.
 #   Step 7:   opentelemetry-cpp for telemetry.
 # ---------------------------------------------------------------------------
+
+# Raft consensus core. Note: links nothing but the standard library.
+add_library(rafty src/raft.cpp)
+target_include_directories(rafty PUBLIC ${CMAKE_SOURCE_DIR}/inc)
+target_link_libraries(rafty PRIVATE raft_kv_warnings)
+
+# Test tooling (FakeClock, SimNetwork, SimCluster). Header-only.
+add_library(toolings INTERFACE)
+target_link_libraries(toolings INTERFACE rafty)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+enable_testing()
+find_package(GTest REQUIRED)
+include(GoogleTest)
+
+# Unit tests: one Raft node driven by hand.
+add_executable(unit_tests
+  unittests/raft_election_test.cpp
+  unittests/raft_log_test.cpp)
+# toolings already brings in rafty; listing both makes Apple ld warn about
+# duplicate libraries.
+target_link_libraries(unit_tests PRIVATE toolings GTest::gtest_main
+                                         raft_kv_warnings)
+gtest_discover_tests(unit_tests)
+
+# Integration tests: whole clusters on the simulated network.
+add_executable(integration_tests
+  integration_tests/election_test.cpp
+  integration_tests/replication_test.cpp)
+target_link_libraries(integration_tests PRIVATE toolings
+                                                GTest::gtest_main
+                                                raft_kv_warnings)
+# The chaos test runs 200 seeds; give it room under sanitizers.
+gtest_discover_tests(integration_tests PROPERTIES TIMEOUT 600)
