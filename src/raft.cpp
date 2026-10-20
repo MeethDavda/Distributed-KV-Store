@@ -123,11 +123,27 @@ std::vector<LogEntry> Raft::take_committed() {
   return out;
 }
 
+bool Raft::read_index(uint64_t id) {
+  if (role_ != Role::Leader) return false;
+  pending_reads_.push_back(PendingRead{id, 0, 0});
+  start_pending_reads();
+  return true;
+}
+
+std::vector<Raft::ReadState> Raft::take_reads() {
+  std::vector<ReadState> out;
+  out.swap(ready_reads_);
+  return out;
+}
+
 // ===========================================================================
 // Role transitions
 // ===========================================================================
 
 void Raft::become_follower(Term term, NodeId leader) {
+  // K6: a leader that steps down can no longer prove its reads are fresh.
+  fail_all_reads();
+
   // Term monotonicity: callers only ever pass a term >= ours.
   if (term > hs_.current_term) {
     // New term: the old vote belonged to the old term, so clear it.
@@ -176,6 +192,7 @@ void Raft::become_leader() {
   leader_id_ = cfg_.id;
   votes_.clear();
   last_ack_.clear();
+  acked_round_.clear();  // echoes from an earlier leadership do not count
 
   // Optimistic start: assume every follower matches our whole log. Wrong
   // guesses are fixed by rejections. match starts at 0 because nothing is
@@ -297,6 +314,7 @@ void Raft::handle_append_entries(NodeId from, const AppendEntriesReq& req) {
     r.success = false;
     r.rejected_index = req.prev_log_index;
     r.last_log_index = last_log_index();
+    r.read_round = req.read_round;  // echo, for the leader's ReadIndex
     send(from, r);
   };
 
@@ -338,6 +356,7 @@ void Raft::handle_append_entries(NodeId from, const AppendEntriesReq& req) {
   ok.term = hs_.current_term;
   ok.success = true;
   ok.match_index = last_new;
+  ok.read_round = req.read_round;  // echo, for the leader's ReadIndex
   send(from, ok);
 }
 
@@ -379,6 +398,13 @@ void Raft::handle_append_entries_resp(NodeId from,
   if (role_ != Role::Leader || resp.term != hs_.current_term) return;
 
   last_ack_[from] = clock_.now();  // proof this peer is reachable
+
+  // ReadIndex: this reply (success or reject) shows `from` accepted us as
+  // leader in this term at heartbeat round `read_round` or later.
+  uint64_t& acked = acked_round_[from];
+  acked = std::max(acked, resp.read_round);
+  confirm_reads();
+
   Progress& p = progress_[from];
 
   if (resp.success) {
@@ -431,6 +457,7 @@ void Raft::send_append(NodeId peer) {
   const Index hi = std::min<Index>(last + 1, p.next + cfg_.max_entries_per_msg);
   if (p.next < hi) req.entries = storage_.entries(p.next, hi);
   req.leader_commit = commit_index_;
+  req.read_round = read_round_;
   send(peer, std::move(req));
 }
 
@@ -457,9 +484,62 @@ void Raft::maybe_advance_commit() {
     }
     if (replicas >= quorum()) {
       commit_index_ = n;
+      start_pending_reads();  // the first commit in our term unblocks reads
       return;
     }
   }
+}
+
+// ===========================================================================
+// ReadIndex helpers
+// ===========================================================================
+
+void Raft::start_pending_reads() {
+  if (role_ != Role::Leader) return;
+
+  // Condition 1: we must have committed an entry in our own term (normally
+  // the no-op). Before that, commit_index_ may be behind what an earlier
+  // leader committed, and a read could miss a finished write.
+  if (storage_.term_at(commit_index_) != hs_.current_term) return;
+
+  // Give every waiting read the current commit index and ONE new heartbeat
+  // round, so reads that arrive together share a single round trip.
+  bool any = false;
+  for (PendingRead& r : pending_reads_) {
+    if (r.round != 0) continue;
+    if (!any) ++read_round_;
+    any = true;
+    r.index = commit_index_;
+    r.round = read_round_;
+  }
+  if (!any) return;
+
+  // Condition 2 starts here: heartbeats stamped with the new round.
+  broadcast_append();
+  confirm_reads();  // single-node cluster: we alone are the majority
+}
+
+void Raft::confirm_reads() {
+  // A read started at round R is safe once a majority (counting us) has
+  // echoed a round >= R. Rounds only grow, so such an echo was sent after
+  // the read began, by a node that still accepted us as leader.
+  std::erase_if(pending_reads_, [&](const PendingRead& r) {
+    if (r.round == 0) return false;  // still waiting for condition 1
+    std::size_t acks = 1;
+    for (const auto& [peer, round] : acked_round_) {
+      if (round >= r.round) ++acks;
+    }
+    if (acks < quorum()) return false;
+    ready_reads_.push_back(ReadState{r.id, r.index, true});
+    return true;
+  });
+}
+
+void Raft::fail_all_reads() {
+  for (const PendingRead& r : pending_reads_) {
+    ready_reads_.push_back(ReadState{r.id, 0, false});
+  }
+  pending_reads_.clear();
 }
 
 // ===========================================================================

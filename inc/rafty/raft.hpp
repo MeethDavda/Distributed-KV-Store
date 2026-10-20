@@ -72,6 +72,27 @@ class Raft {
   // them applied. The driver feeds these to the state machine.
   std::vector<LogEntry> take_committed();
 
+  // ---- Linearizable reads (ReadIndex, Raft thesis 6.4) ----
+  //
+  // Leader only; returns false otherwise. Registers read `id`. Once it is
+  // safe, take_reads() returns {id, index, ok=true}: the caller may then
+  // answer the read from its state machine as soon as it has applied up to
+  // `index`. If leadership is lost first, it returns {id, 0, ok=false}.
+  //
+  // Safe means:
+  //   1. we have committed an entry in our current term (the no-op), so our
+  //      commit index is not behind a previous leader's, and
+  //   2. after the read arrived, a majority acknowledged a heartbeat from us
+  //      in this term, so no newer leader can exist.
+  bool read_index(uint64_t id);
+
+  struct ReadState {
+    uint64_t id = 0;
+    Index index = 0;  // serve once the state machine has applied this
+    bool ok = false;  // false: leadership lost, client should retry
+  };
+  std::vector<ReadState> take_reads();
+
   // Read-only accessors for drivers and tests.
   NodeId id() const { return cfg_.id; }
   Role role() const { return role_; }
@@ -110,6 +131,11 @@ class Raft {
   // Follower: merge req.entries into our log; returns index of last new entry.
   Index merge_entries(const AppendEntriesReq& req);
 
+  // ---- reads ----
+  void start_pending_reads();  // give waiting reads an index + new round
+  void confirm_reads();        // move reads acked by a majority to ready
+  void fail_all_reads();       // on losing leadership
+
   // ---- helpers ----
   void broadcast_request_vote(bool pre_vote);
   void send(NodeId to, Payload payload);
@@ -147,6 +173,18 @@ class Raft {
   std::map<NodeId, Millis> last_ack_; // leader: last response per peer
 
   std::map<NodeId, Progress> progress_;  // leader only, reset on election
+
+  // ---- ReadIndex state (leader only) ----
+  struct PendingRead {
+    uint64_t id = 0;
+    Index index = 0;     // commit index when the read was started
+    uint64_t round = 0;  // needs a majority to ack this round; 0 = waiting
+                         // for our first commit in this term
+  };
+  std::vector<PendingRead> pending_reads_;
+  std::vector<ReadState> ready_reads_;
+  uint64_t read_round_ = 0;              // current heartbeat round
+  std::map<NodeId, uint64_t> acked_round_;  // highest round each peer echoed
 };
 
 }  // namespace rafty

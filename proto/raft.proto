@@ -1,0 +1,78 @@
+// Wire format for Raft messages between nodes.
+//
+// These mirror the plain C++ structs in inc/rafty/types.hpp field for field.
+// src/net/convert.cpp maps between the two; the Raft core never sees proto.
+//
+// Raft runs as one-way message passing: a node sends a RaftMessage and gets
+// an empty Ack back. A Raft *reply* (e.g. RequestVoteResp) is just another
+// RaftMessage sent the other way. This matches the core's fire-and-forget
+// Transport::send() exactly, so no Raft code depends on RPC semantics.
+//
+// Field numbers are the wire identity: never reuse or renumber them.
+
+syntax = "proto3";
+
+package raftpb;
+
+enum EntryType {
+  ENTRY_NORMAL = 0;  // client command (data = encoded kv::Command)
+  ENTRY_NOOP = 1;    // a new leader's no-op
+}
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  EntryType type = 3;
+  bytes data = 4;  // bytes, not string: arbitrary binary, no UTF-8 check
+}
+
+message RequestVoteReq {
+  uint64 term = 1;
+  uint64 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+  bool pre_vote = 5;
+}
+
+message RequestVoteResp {
+  uint64 term = 1;
+  bool vote_granted = 2;
+  bool pre_vote = 3;
+}
+
+message AppendEntriesReq {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+  uint64 read_round = 7;
+}
+
+message AppendEntriesResp {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 match_index = 3;
+  uint64 rejected_index = 4;
+  uint64 last_log_index = 5;
+  uint64 read_round = 6;
+}
+
+// The envelope: exactly one payload, like rafty::Payload (a std::variant).
+message RaftMessage {
+  uint64 from = 1;
+  uint64 to = 2;
+  oneof payload {
+    RequestVoteReq request_vote = 3;
+    RequestVoteResp request_vote_resp = 4;
+    AppendEntriesReq append_entries = 5;
+    AppendEntriesResp append_entries_resp = 6;
+  }
+}
+
+message Ack {}
+
+service Raft {
+  rpc Send(RaftMessage) returns (Ack);
+}

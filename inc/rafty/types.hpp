@@ -84,6 +84,10 @@ struct AppendEntriesReq {
   // AppendEntriesReq{term, leader} (a heartbeat) is warning-free.
   std::vector<LogEntry> entries{};  // indices prev_log_index+1, +2, ...
   Index leader_commit = 0;
+
+  // ReadIndex: the leader's current heartbeat round. Followers echo it, so
+  // the leader can tell which round a reply answers (see Raft::read_index).
+  uint64_t read_round = 0;
 };
 
 struct AppendEntriesResp {
@@ -100,6 +104,10 @@ struct AppendEntriesResp {
   // jump next_index back in one step instead of one entry per round trip).
   Index rejected_index = 0;
   Index last_log_index = 0;
+
+  // Echo of the request's read_round. Any reply in the current term counts,
+  // success or reject: either way the follower accepted us as leader.
+  uint64_t read_round = 0;
 };
 
 // Envelope used by Transport. `from`/`to` live here, not in every payload.

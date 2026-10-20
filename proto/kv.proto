@@ -1,0 +1,44 @@
+// Wire format between KV clients and KV servers.
+//
+// Mirrors kv::KvRequest / kv::KvResponse in inc/kv/kv_server.hpp; mapped by
+// src/net/convert.cpp. One unary RPC carries every operation.
+//
+// Field numbers are the wire identity: never reuse or renumber them.
+
+syntax = "proto3";
+
+package kvpb;
+
+// Enum values are prefixed because proto3 enum values share one namespace
+// per package (a bare OK or DELETE would collide or clash with macros).
+enum Op {
+  OP_GET = 0;
+  OP_PUT = 1;
+  OP_APPEND = 2;
+  OP_DELETE = 3;
+}
+
+enum Status {
+  STATUS_OK = 0;
+  STATUS_NOT_LEADER = 1;
+}
+
+message KvRequest {
+  Op op = 1;
+  uint64 client_id = 2;
+  uint64 seq = 3;  // retries reuse it: the server dedups on (client_id, seq)
+  bytes key = 4;
+  bytes value = 5;
+}
+
+message KvResponse {
+  Status status = 1;
+  uint64 seq = 2;  // echoed, so the client can drop stale replies
+  bool found = 3;
+  bytes value = 4;
+  uint64 leader_hint = 5;  // 0 = unknown
+}
+
+service KV {
+  rpc Execute(KvRequest) returns (KvResponse);
+}

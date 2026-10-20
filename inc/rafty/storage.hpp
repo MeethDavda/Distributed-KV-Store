@@ -8,15 +8,29 @@
 //   - Volatile state: role, commitIndex, who voted for us, timers. Rebuilt
 //     from scratch after a restart.
 //
-// raft.cpp only sees the Storage interface. Steps 1-2 use MemStorage (below).
-// Step 3 adds a WAL-backed implementation in storage.cpp with CRCs and fsync.
+// raft.cpp only sees the Storage interface. Two implementations:
+//   - MemStorage: in-memory, for unit tests and fast simulation.
+//   - FileStorage: write-ahead log + hard state file on disk (storage.cpp).
 
 #include <cassert>
+#include <cstdint>
+#include <filesystem>
 #include <vector>
 
 #include "rafty/types.hpp"
 
 namespace rafty {
+
+// How hard FileStorage pushes writes to stable storage. Recorded in every
+// benchmark result, because it dominates write latency.
+//   None:      no sync at all. NOT durable; benchmarks/comparison only.
+//   Fsync:     fsync(2). On Linux this flushes to the device. On macOS it
+//              only reaches the drive's volatile cache.
+//   FullFsync: fcntl(F_FULLFSYNC) on macOS, which also flushes the drive
+//              cache. Falls back to fsync where F_FULLFSYNC does not exist.
+enum class FsyncMode { None, Fsync, FullFsync };
+
+const char* to_string(FsyncMode m);
 
 // Persistent state needed for elections.
 //
@@ -125,5 +139,66 @@ class MemStorage final : public Storage {
   std::vector<LogEntry> log_;  // log_[i - 1] holds index i
   int save_count_ = 0;
 };
+
+// Durable Storage on disk. Four ideas:
+//
+//   1. Append-only log file ("wal"). Each entry is one record added to the
+//      end:  [u32 length][u32 crc][u64 term][u64 index][u8 type][data]
+//      On startup the file is replayed to rebuild the log.
+//
+//   2. A checksum (CRC32) per record. A crash mid-write leaves a half-written
+//      last record. Recovery detects it (short or bad CRC) and cuts it off.
+//      Safe, because that append() never returned, so it was never acked.
+//
+//   3. Sync before returning. The OS caches writes in RAM; sync_file()
+//      forces them to disk (F_FULLFSYNC on macOS, see FsyncMode).
+//
+//   4. Atomic rename for term + vote ("hardstate"). Write hardstate.tmp,
+//      sync, rename over hardstate. rename() is atomic, so a crash leaves
+//      the old or the new version, never a mix.
+//
+// Errors: a failed write or sync aborts the process. Retrying a failed
+// fsync can falsely "succeed" because the kernel may have dropped the data
+// (PostgreSQL's fsyncgate), so crash and recover from the log instead.
+//
+// The log is also kept in memory for reads; snapshots (step 5) bound it.
+class FileStorage final : public Storage {
+ public:
+  // Opens (or creates) `dir` and runs recovery.
+  FileStorage(std::filesystem::path dir, FsyncMode mode);
+  ~FileStorage() override;
+
+  FileStorage(const FileStorage&) = delete;
+  FileStorage& operator=(const FileStorage&) = delete;
+
+  void save_hard_state(const HardState& hs) override;
+  HardState load_hard_state() const override { return hs_; }
+
+  Index last_index() const override { return log_.size(); }
+  Term term_at(Index i) const override;
+  std::vector<LogEntry> entries(Index lo, Index hi) const override;
+  void append(const std::vector<LogEntry>& entries) override;
+  void truncate_from(Index i) override;
+
+  // File names inside `dir`, exposed so tests can damage them on purpose.
+  static constexpr const char* kWalFile = "wal";
+  static constexpr const char* kHardStateFile = "hardstate";
+
+ private:
+  void load_hard_state_file();
+  void replay_wal();
+  void sync_file(int fd) const;
+  void sync_dir() const;
+
+  std::filesystem::path dir_;
+  FsyncMode mode_;
+  int wal_fd_ = -1;
+
+  HardState hs_;
+  std::vector<LogEntry> log_;  // log_[i - 1] holds index i
+};
+
+// CRC-32 (IEEE 802.3 polynomial, as used by zlib/PNG). Exposed for tests.
+uint32_t crc32(const void* data, std::size_t len);
 
 }  // namespace rafty

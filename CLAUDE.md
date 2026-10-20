@@ -134,7 +134,7 @@ Export these via OpenTelemetry: term, role per node, commit index, last applied,
 5. Snapshots and InstallSnapshot
 6. Fault injection, integration tests, history logging, linearizability checker
 7. Telemetry and Grafana dashboard
-8. Benchmarks, plots, README with numbers
+8. Benchmarks, plots, README with numbers 
 
 ## Working style for Claude
 

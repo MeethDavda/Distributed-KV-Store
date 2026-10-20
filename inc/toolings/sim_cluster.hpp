@@ -17,13 +17,22 @@
 //                 at one index), in-order apply
 //   new leader:   Leader Completeness (it holds every committed entry)
 //   periodically: Log Matching across every pair of nodes
+//
+// Storage modes:
+//   default:          MemStorage. A crash keeps the object, like a disk.
+//   data_dir is set:  FileStorage in data_dir/n<id>. A crash closes the
+//                     files and a restart reopens them, so every restart
+//                     runs the real WAL recovery code.
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,19 +49,53 @@ using rafty::LogEntry;
 using rafty::MemStorage;
 using rafty::Raft;
 using rafty::Role;
+using rafty::Storage;
 using rafty::Term;
 
 class SimCluster {
  public:
   // Nodes get ids 1..n. `base` supplies timeouts and feature flags; id,
-  // peers, and seed are filled in per node.
-  SimCluster(int n, uint64_t seed, Config base = {})
-      : seed_(seed), base_(std::move(base)), net_(clock_, seed) {
+  // peers, and seed are filled in per node. If `data_dir` is given, nodes
+  // use FileStorage there (and the directory is deleted on destruction).
+  SimCluster(int n, uint64_t seed, Config base = {},
+             std::optional<std::filesystem::path> data_dir = std::nullopt)
+      : seed_(seed),
+        base_(std::move(base)),
+        data_dir_(std::move(data_dir)),
+        net_(clock_, seed),
+        fault_rng_(seed ^ 0x70A2ULL) {
+    if (data_dir_) std::filesystem::remove_all(*data_dir_);
     for (NodeId id = 1; id <= static_cast<NodeId>(n); ++id) ids_.push_back(id);
     for (NodeId id : ids_) {
-      storage_[id] = std::make_unique<MemStorage>();
+      open_storage(id);
       start_node(id);
     }
+  }
+
+  ~SimCluster() {
+    nodes_.clear();    // Raft objects hold references to storage
+    storage_.clear();  // close files before deleting them
+    if (data_dir_) std::filesystem::remove_all(*data_dir_);
+  }
+
+  SimCluster(const SimCluster&) = delete;
+  SimCluster& operator=(const SimCluster&) = delete;
+
+  // ---- Application hook ----
+
+  // By default the cluster takes committed entries from each node itself
+  // (take_committed) to run its checks. An application layer such as
+  // KvServer needs those entries instead, so it can install a drain: called
+  // once per live node per step, it must consume the node's committed
+  // entries and return them, so the safety checks still see everything.
+  using Drain = std::function<std::vector<LogEntry>(NodeId, Raft&)>;
+  void set_drain(Drain d) { drain_ = std::move(d); }
+
+  // Mutable access for the application layer (KvServer wraps the Raft node).
+  // nullptr while the node is crashed.
+  Raft* mutable_node(NodeId id) {
+    auto it = nodes_.find(id);
+    return it == nodes_.end() ? nullptr : it->second.get();
   }
 
   // ---- Driving time ----
@@ -106,11 +149,27 @@ class SimCluster {
 
   // ---- Faults ----
 
-  // Process dies: the Raft object (all volatile state) is destroyed, but its
-  // MemStorage survives, like a disk would.
+  // Process dies: the Raft object (all volatile state) is destroyed. With
+  // MemStorage the storage object survives, like a disk. With FileStorage
+  // the files are closed; only what is on disk survives.
   void crash(NodeId id) {
     net_.set_down(id, true);
     nodes_[id].reset();
+    if (data_dir_) storage_[id].reset();
+  }
+
+  // FileStorage mode only: crash while an append was half-written. Junk
+  // bytes (a partial record) are left at the end of the WAL, as a power cut
+  // mid-write would. That append never returned, so Raft never acked it;
+  // recovery must cut it off and the cluster must stay safe.
+  void crash_with_torn_tail(NodeId id) {
+    crash(id);
+    if (!data_dir_) return;
+    std::string junk(1 + fault_rng_() % 40, '\0');
+    for (char& b : junk) b = static_cast<char>(fault_rng_());
+    std::ofstream wal(node_dir(id) / rafty::FileStorage::kWalFile,
+                      std::ios::binary | std::ios::app);
+    wal.write(junk.data(), static_cast<std::streamsize>(junk.size()));
   }
 
   // Process comes back and recovers term, vote, and log from its storage.
@@ -119,6 +178,7 @@ class SimCluster {
     net_.set_down(id, false);
     last_commit_.erase(id);
     applied_.erase(id);
+    if (!storage_[id]) open_storage(id);  // runs WAL recovery
     start_node(id);
   }
 
@@ -170,7 +230,9 @@ class SimCluster {
   }
 
   const std::vector<NodeId>& ids() const { return ids_; }
-  const MemStorage& storage(NodeId id) const { return *storage_.at(id); }
+  // A node's storage. In FileStorage mode a crashed node has none (its files
+  // are closed), so only call this for live nodes there.
+  const Storage& storage(NodeId id) const { return *storage_.at(id); }
   SimNetwork& net() { return net_; }
   FakeClock& clock() { return clock_; }
   uint64_t seed() const { return seed_; }
@@ -186,6 +248,22 @@ class SimCluster {
   // and State Machine Safety (checked every step) catches any mismatch that
   // was ever applied.
   static constexpr uint64_t kLogMatchingEvery = 200;  // steps
+
+  std::filesystem::path node_dir(NodeId id) const {
+    return *data_dir_ / ("n" + std::to_string(id));
+  }
+
+  void open_storage(NodeId id) {
+    if (data_dir_) {
+      // FsyncMode::None: a simulated crash is a closed file, not a power
+      // cut, so the page cache survives it and syncing would only slow the
+      // tests. Real sync behaviour is covered by storage_test.cpp.
+      storage_[id] = std::make_unique<rafty::FileStorage>(
+          node_dir(id), rafty::FsyncMode::None);
+    } else {
+      storage_[id] = std::make_unique<MemStorage>();
+    }
+  }
 
   void start_node(NodeId id) {
     Config cfg = base_;
@@ -206,7 +284,7 @@ class SimCluster {
     for (NodeId id : ids_) {
       auto& r = nodes_[id];
       if (!r) continue;
-      for (LogEntry& e : r->take_committed()) {
+      for (LogEntry& e : drain_ ? drain_(id, *r) : r->take_committed()) {
         auto& mine = applied_[id];
         // Entries must be applied exactly once each, in index order.
         const Index expected = mine.empty() ? 1 : mine.back().index + 1;
@@ -269,7 +347,7 @@ class SimCluster {
 
   // Leader Completeness: a new leader's log contains every committed entry.
   void check_leader_completeness(NodeId id) {
-    const MemStorage& s = *storage_[id];
+    const Storage& s = *storage_[id];
     for (const auto& [idx, e] : committed_) {
       if (idx > s.last_index() || s.term_at(idx) != e.term) {
         fail("leader completeness: new leader " + std::to_string(id) +
@@ -285,8 +363,10 @@ class SimCluster {
   void check_log_matching() {
     for (std::size_t a = 0; a < ids_.size(); ++a) {
       for (std::size_t b = a + 1; b < ids_.size(); ++b) {
-        const MemStorage& sa = *storage_[ids_[a]];
-        const MemStorage& sb = *storage_[ids_[b]];
+        // In FileStorage mode a crashed node's files are closed: skip it.
+        if (!storage_[ids_[a]] || !storage_[ids_[b]]) continue;
+        const Storage& sa = *storage_[ids_[a]];
+        const Storage& sb = *storage_[ids_[b]];
         Index i = std::min(sa.last_index(), sb.last_index());
         while (i > 0 && sa.term_at(i) != sb.term_at(i)) --i;
         if (i == 0) continue;
@@ -306,14 +386,18 @@ class SimCluster {
 
   uint64_t seed_;
   Config base_;
+  std::optional<std::filesystem::path> data_dir_;
   FakeClock clock_;
   SimNetwork net_;  // declared after clock_: it holds a reference to it
+  std::mt19937_64 fault_rng_;  // junk bytes for torn tails
 
   std::vector<NodeId> ids_;
-  std::map<NodeId, std::unique_ptr<MemStorage>> storage_;
+  std::map<NodeId, std::unique_ptr<Storage>> storage_;  // null if file mode
+                                                        // and crashed
   std::map<NodeId, std::unique_ptr<Raft>> nodes_;  // null while crashed
   uint64_t restarts_ = 0;
   uint64_t steps_ = 0;
+  Drain drain_;  // empty: take_committed() directly
 
   std::map<NodeId, Term> last_term_;
   std::map<NodeId, Index> last_commit_;

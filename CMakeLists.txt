@@ -51,10 +51,49 @@ endif()
 #   Step 7:   opentelemetry-cpp for telemetry.
 # ---------------------------------------------------------------------------
 
-# Raft consensus core. Note: links nothing but the standard library.
-add_library(rafty src/raft.cpp)
+# Raft consensus core plus its storage. Links nothing but the standard
+# library. storage.cpp is the only file here that touches the disk.
+add_library(rafty
+  src/raft.cpp
+  src/storage.cpp)
 target_include_directories(rafty PUBLIC ${CMAKE_SOURCE_DIR}/inc)
 target_link_libraries(rafty PRIVATE raft_kv_warnings)
+
+# KV layer: the state machine applied on top of Raft's committed log.
+# Depends on rafty only for its types (LogEntry, Index); Raft itself knows
+# nothing about keys and values.
+add_library(kv
+  src/state_machine.cpp
+  src/kv_server.cpp
+  src/kv_client.cpp)
+target_link_libraries(kv PUBLIC rafty PRIVATE raft_kv_warnings)
+
+# ---------------------------------------------------------------------------
+# Networking (step 4d): gRPC + Protocol Buffers
+#
+# Only the `proto_gen` and (later) `net` libraries link gRPC. `rafty` and `kv`
+# stay free of it: they speak plain C++ structs, and a converter maps those
+# to/from proto at the boundary. The core can still be tested with no network.
+# ---------------------------------------------------------------------------
+find_package(Protobuf CONFIG REQUIRED)
+find_package(gRPC CONFIG REQUIRED)
+
+# C++ code generated from proto/*.proto at build time:
+#   raft.pb.h/.cc, kv.pb.h/.cc         messages   (protoc)
+#   raft.grpc.pb.h/.cc, kv.grpc.pb.h/.cc  services (gRPC plugin)
+# Output goes to the build directory; include as "raft.pb.h" etc.
+add_library(proto_gen
+  proto/raft.proto
+  proto/kv.proto)
+target_link_libraries(proto_gen PUBLIC protobuf::libprotobuf gRPC::grpc++)
+target_include_directories(proto_gen PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+protobuf_generate(TARGET proto_gen LANGUAGE cpp
+  IMPORT_DIRS ${CMAKE_SOURCE_DIR}/proto)
+protobuf_generate(TARGET proto_gen LANGUAGE grpc
+  GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
+  PLUGIN "protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
+  IMPORT_DIRS ${CMAKE_SOURCE_DIR}/proto)
+# Generated code is not ours: no raft_kv_warnings on this target.
 
 # Test tooling (FakeClock, SimNetwork, SimCluster). Header-only.
 add_library(toolings INTERFACE)
@@ -70,18 +109,23 @@ include(GoogleTest)
 # Unit tests: one Raft node driven by hand.
 add_executable(unit_tests
   unittests/raft_election_test.cpp
-  unittests/raft_log_test.cpp)
-# toolings already brings in rafty; listing both makes Apple ld warn about
-# duplicate libraries.
-target_link_libraries(unit_tests PRIVATE toolings GTest::gtest_main
+  unittests/raft_log_test.cpp
+  unittests/raft_read_test.cpp
+  unittests/storage_test.cpp
+  unittests/state_machine_test.cpp)
+# toolings and kv already bring in rafty; listing it too makes Apple ld warn
+# about duplicate libraries.
+target_link_libraries(unit_tests PRIVATE toolings kv GTest::gtest_main
                                          raft_kv_warnings)
 gtest_discover_tests(unit_tests)
 
 # Integration tests: whole clusters on the simulated network.
 add_executable(integration_tests
   integration_tests/election_test.cpp
-  integration_tests/replication_test.cpp)
-target_link_libraries(integration_tests PRIVATE toolings
+  integration_tests/replication_test.cpp
+  integration_tests/recovery_test.cpp
+  integration_tests/kv_test.cpp)
+target_link_libraries(integration_tests PRIVATE toolings kv
                                                 GTest::gtest_main
                                                 raft_kv_warnings)
 # The chaos test runs 200 seeds; give it room under sanitizers.
