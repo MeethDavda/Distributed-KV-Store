@@ -37,6 +37,7 @@
 #include "net/grpc_transport.hpp"
 #include "rafty/raft.hpp"
 #include "rafty/storage.hpp"
+#include "telemetry/metrics.hpp"
 #include "toolings/msg_queue.hpp"
 
 namespace net {
@@ -47,6 +48,7 @@ struct NodeConfig {
   std::filesystem::path data_dir;
   rafty::FsyncMode fsync = rafty::FsyncMode::FullFsync;
   rafty::Millis tick{10};  // how often the loop calls Raft::tick()
+  std::string otlp_endpoint;  // e.g. "localhost:4317"; empty = no metrics
 };
 
 class KvNode {
@@ -90,6 +92,7 @@ class KvNode {
   void log_role_changes();
 
   NodeConfig cfg_;
+  telemetry::Metrics metrics_;  // thread-safe: loop + gRPC threads use it
   toolings::BlockingQueue<Event> events_{4096};  // before transport_: its
                                                  // inbox pushes here
   rafty::FileStorage storage_;

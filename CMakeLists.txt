@@ -110,13 +110,24 @@ if(SANITIZE STREQUAL "address")
 endif()
 target_compile_options(proto_gen PRIVATE ${NO_ASAN_FOR_PROTOBUF})
 
-# The network edge: struct <-> proto conversion (and, next, the gRPC
-# transport). The only library besides proto_gen that sees protobuf.
+# Telemetry (step 7): OpenTelemetry metrics exported over OTLP/gRPC.
+# The OTel types stay inside src/telemetry.cpp (pimpl), so only this
+# library links opentelemetry-cpp.
+find_package(opentelemetry-cpp CONFIG REQUIRED)
+add_library(telemetry src/telemetry.cpp)
+target_include_directories(telemetry PUBLIC ${CMAKE_SOURCE_DIR}/inc)
+target_link_libraries(telemetry
+  PRIVATE opentelemetry-cpp::metrics opentelemetry-cpp::otlp_grpc_metrics_exporter
+          raft_kv_warnings)
+target_compile_options(telemetry PRIVATE ${NO_ASAN_FOR_PROTOBUF})
+
+# The network edge: struct <-> proto conversion, gRPC transport, node
+# runtime. The only library besides proto_gen that sees protobuf.
 add_library(net
   src/net/convert.cpp
   src/net/grpc_transport.cpp
   src/net/kv_node.cpp)
-target_link_libraries(net PUBLIC kv proto_gen PRIVATE raft_kv_warnings)
+target_link_libraries(net PUBLIC kv proto_gen telemetry PRIVATE raft_kv_warnings)
 target_compile_options(net PRIVATE ${NO_ASAN_FOR_PROTOBUF})
 
 # ---------------------------------------------------------------------------

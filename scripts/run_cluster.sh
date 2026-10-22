@@ -3,6 +3,7 @@
 #
 #   scripts/run_cluster.sh            # 3 nodes, fsync=fullfsync
 #   NODES=5 FSYNC=none scripts/run_cluster.sh
+#   OTLP=localhost:4317 scripts/run_cluster.sh   # export metrics to Grafana
 #
 # Node i listens on port 50050+i and stores its data in data/n<i>. Logs go to
 # data/n<i>.log. Ctrl-C stops every node. To test crash recovery, find the
@@ -30,6 +31,7 @@ mkdir -p data
 PIDS=()
 for i in $(seq 1 "$NODES"); do
   CMD=("$BIN" --id "$i" --peers "$PEERS" --data "data/n$i" --fsync "$FSYNC")
+  if [[ -n "${OTLP:-}" ]]; then CMD+=(--otlp "$OTLP"); fi
   "${CMD[@]}" >"data/n$i.log" 2>&1 &
   PIDS+=($!)
   echo "node $i  pid $!  restart: ${CMD[*]} >>data/n$i.log 2>&1 &"

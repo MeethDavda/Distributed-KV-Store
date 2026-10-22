@@ -52,6 +52,7 @@ const char* role_name(rafty::Role r) {
 
 KvNode::KvNode(NodeConfig cfg)
     : cfg_(std::move(cfg)),
+      metrics_(cfg_.id, cfg_.otlp_endpoint),
       storage_(cfg_.data_dir, cfg_.fsync),
       transport_(peers_of(cfg_),
                  [this](rafty::Message m) { events_.push(std::move(m)); }),
@@ -105,6 +106,7 @@ void KvNode::wait() {
 
 void KvNode::loop() {
   auto next_tick = clock_.now() + cfg_.tick;
+  auto next_metrics = clock_.now();
   while (running_) {
     // Sleep until the next event or the next tick, whichever comes first.
     const auto wait = std::max(next_tick - clock_.now(), rafty::Millis{0});
@@ -116,6 +118,13 @@ void KvNode::loop() {
     }
     kv_server_.process();  // apply commits, answer clients
     log_role_changes();
+
+    // Telemetry: publish Raft state about once a second.
+    if (clock_.now() >= next_metrics) {
+      metrics_.set_raft_state(raft_.term(), raft_.role() == rafty::Role::Leader,
+                              raft_.commit_index(), raft_.last_applied());
+      next_metrics = clock_.now() + rafty::Millis{1000};
+    }
   }
 }
 
@@ -158,6 +167,18 @@ grpc::Status KvNode::KvService::Execute(grpc::ServerContext* ctx,
                                         kvpb::KvResponse* out) {
   auto r = from_proto(*req);
   if (!r) return {grpc::StatusCode::INVALID_ARGUMENT, "bad request"};
+
+  // Latency as the server sees it: from arrival to reply, recorded on exit.
+  const auto start = std::chrono::steady_clock::now();
+  struct RecordOnExit {
+    telemetry::Metrics& m;
+    std::chrono::steady_clock::time_point t0;
+    ~RecordOnExit() {
+      m.record_request(std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count());
+    }
+  } record{node_.metrics_, start};
 
   kv::KvResponse retry;  // what the client gets if we cannot answer in time
   retry.status = kv::Status::NotLeader;

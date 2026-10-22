@@ -1,0 +1,56 @@
+{
+  "uid": "raft-kv",
+  "title": "raft-kv",
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Term per node",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "raft_term", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Leader (1 = leader)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "raft_is_leader", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Commit index / last applied",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "raft_commit_index", "legendFormat": "commit {{instance}}" },
+        { "expr": "raft_last_applied", "legendFormat": "applied {{instance}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Client requests / s",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(kv_requests_total[30s]))", "legendFormat": "requests/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Request latency (ms)",
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le) (rate(kv_request_latency_ms_bucket[1m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(kv_request_latency_ms_bucket[1m])))", "legendFormat": "p99" }
+      ]
+    }
+  ]
+}

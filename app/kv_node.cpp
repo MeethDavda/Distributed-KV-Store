@@ -1,7 +1,7 @@
 // kv_node: runs one Raft + KV server process.
 //
 //   kv_node --id 1 --peers 1=127.0.0.1:50051,2=127.0.0.1:50052,3=127.0.0.1:50053
-//           [--data ./data/n1] [--fsync none|fsync|fullfsync]
+//           [--data ./data/n1] [--fsync none|fsync|fullfsync] [--otlp HOST:PORT]
 //
 // --peers lists EVERY node, including this one; this node listens on its own
 // address. Ctrl-C / SIGTERM shuts down cleanly. kill -9 does not, on purpose:
@@ -22,7 +22,7 @@ namespace {
 [[noreturn]] void usage() {
   std::fprintf(stderr,
                "usage: kv_node --id N --peers ID=HOST:PORT,... "
-               "[--data DIR] [--fsync none|fsync|fullfsync]\n");
+               "[--data DIR] [--fsync none|fsync|fullfsync] [--otlp HOST:PORT]\n");
   std::exit(2);
 }
 
@@ -59,6 +59,8 @@ net::NodeConfig parse_args(int argc, char** argv) {
       cfg.data_dir = val;
     } else if (flag == "--fsync") {
       cfg.fsync = parse_fsync(val);
+    } else if (flag == "--otlp") {
+      cfg.otlp_endpoint = val;  // e.g. localhost:4317 (Grafana suite)
     } else {
       usage();
     }
