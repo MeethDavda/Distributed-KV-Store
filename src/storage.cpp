@@ -141,6 +141,7 @@ FileStorage::FileStorage(std::filesystem::path dir, FsyncMode mode)
     : dir_(std::move(dir)), mode_(mode) {
   std::filesystem::create_directories(dir_);
   load_hard_state_file();
+  load_snapshot_file();
   replay_wal();
 }
 
@@ -164,6 +165,25 @@ void FileStorage::load_hard_state_file() {
   hs_.voted_for = get_u64(p + 8);
 }
 
+void FileStorage::load_snapshot_file() {
+  // Layout: [u64 index][u64 term][data...][u32 crc of everything before].
+  std::string buf;
+  if (!read_file(dir_ / kSnapshotFile, buf)) return;  // no snapshot yet
+
+  // Written atomically like hardstate, so damage means a real problem; the
+  // log entries it replaced are gone, so there is nothing safe to fall back
+  // to. Refuse to start.
+  const auto* p = reinterpret_cast<const unsigned char*>(buf.data());
+  if (buf.size() < 20 ||
+      get_u32(p + buf.size() - 4) != crc32(p, buf.size() - 4)) {
+    errno = EINVAL;
+    die("corrupt snapshot", dir_ / kSnapshotFile);
+  }
+  snap_.index = get_u64(p);
+  snap_.term = get_u64(p + 8);
+  snap_.data.assign(buf, 16, buf.size() - 20);
+}
+
 void FileStorage::replay_wal() {
   const auto path = dir_ / kWalFile;
   std::string buf;
@@ -173,12 +193,20 @@ void FileStorage::replay_wal() {
   // Read records until the first one that is incomplete, fails its CRC, or
   // does not continue the log. That can only be the tail of a write that a
   // crash interrupted, so everything from there on is dropped.
-  std::size_t pos = 0;
-  while (buf.size() - pos >= kHeader) {
-    const uint32_t len = get_u32(base + pos);
-    const uint32_t crc = get_u32(base + pos + 4);
-    const unsigned char* payload = base + pos + kHeader;
-    if (len < kPayloadFixed || buf.size() - pos - kHeader < len) break;
+  //
+  // Records the snapshot already covers (index <= snap_.index) are skipped:
+  // they appear only if we crashed after writing a snapshot but before
+  // rewriting the WAL. The record AT the snapshot index must match the
+  // snapshot's term; if not, the WAL is a different (stale) history, as after
+  // an InstallSnapshot, and nothing after it is kept.
+  std::size_t off = 0;
+  Index prev = 0;
+  bool clean = true;  // false if anything was skipped or cut
+  while (buf.size() - off >= kHeader) {
+    const uint32_t len = get_u32(base + off);
+    const uint32_t crc = get_u32(base + off + 4);
+    const unsigned char* payload = base + off + kHeader;
+    if (len < kPayloadFixed || buf.size() - off - kHeader < len) break;
     if (crc32(payload, len) != crc) break;
 
     LogEntry e;
@@ -187,47 +215,90 @@ void FileStorage::replay_wal() {
     e.type = static_cast<EntryType>(payload[16]);
     e.data.assign(reinterpret_cast<const char*>(payload + kPayloadFixed),
                   len - kPayloadFixed);
-    if (e.index != log_.size() + 1) break;  // must be the next index
+    if (prev != 0 && e.index != prev + 1) break;  // records must be contiguous
+    prev = e.index;
+    off += kHeader + len;
 
+    if (e.index <= snap_.index) {  // covered by the snapshot
+      clean = false;
+      if (e.index == snap_.index && e.term != snap_.term) break;
+      continue;
+    }
+    if (e.index != last_index() + 1) {  // must continue the log
+      clean = false;
+      break;
+    }
     log_.push_back(std::move(e));
-    pos += kHeader + len;
   }
+  if (off < buf.size()) clean = false;
 
   wal_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
   if (wal_fd_ < 0) die("open", path);
-  if (pos < buf.size()) {
-    // Cut off the broken tail so new records go right after the good ones.
-    if (::ftruncate(wal_fd_, static_cast<off_t>(pos)) != 0) {
-      die("ftruncate", path);
-    }
-  }
-  sync_file(wal_fd_);
   sync_dir();  // the WAL file may be new; make its directory entry durable
+  // If we skipped or cut anything, rewrite the WAL to hold exactly log_, so
+  // byte offsets (used by truncate_from) match the in-memory log again.
+  if (!clean) rewrite_wal();
 }
 
 // ===========================================================================
 // Writes: always on disk before returning
 // ===========================================================================
 
+void FileStorage::write_file_atomically(const char* name,
+                                        const std::string& bytes) {
+  // Write a temp file, sync it, then atomically rename it into place, and
+  // sync the directory so the rename itself is durable.
+  const auto tmp = dir_ / (std::string(name) + ".tmp");
+  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) die("open", tmp);
+  write_all(fd, bytes, tmp);
+  sync_file(fd);
+  ::close(fd);
+  if (::rename(tmp.c_str(), (dir_ / name).c_str()) != 0) die("rename", tmp);
+  sync_dir();
+}
+
 void FileStorage::save_hard_state(const HardState& hs) {
   std::string buf;
   put_u64(buf, hs.current_term);
   put_u64(buf, hs.voted_for);
   put_u32(buf, crc32(buf.data(), buf.size()));
-
-  // Write a temp file, sync it, then atomically rename it into place.
-  const auto tmp = dir_ / "hardstate.tmp";
-  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0) die("open", tmp);
-  write_all(fd, buf, tmp);
-  sync_file(fd);
-  ::close(fd);
-  if (::rename(tmp.c_str(), (dir_ / kHardStateFile).c_str()) != 0) {
-    die("rename", tmp);
-  }
-  sync_dir();  // the rename changes the directory; make that durable too
-
+  write_file_atomically(kHardStateFile, buf);
   hs_ = hs;
+}
+
+void FileStorage::save_snapshot(const Snapshot& s) {
+  assert(s.index > snap_.index);
+
+  // S3 step 1: the snapshot is durable before any log entry is deleted.
+  std::string buf;
+  put_u64(buf, s.index);
+  put_u64(buf, s.term);
+  buf += s.data;
+  put_u32(buf, crc32(buf.data(), buf.size()));
+  write_file_atomically(kSnapshotFile, buf);
+
+  // S3 step 2: drop covered entries. Keep the suffix only if our log has the
+  // snapshot's last entry (same index and term = same history).
+  const bool same_history =
+      s.index <= last_index() && term_at(s.index) == s.term;
+  if (same_history) {
+    log_.erase(log_.begin(), log_.begin() + static_cast<long>(pos(s.index) + 1));
+  } else {
+    log_.clear();
+  }
+  snap_ = s;
+  rewrite_wal();
+}
+
+void FileStorage::rewrite_wal() {
+  std::string buf;
+  for (const LogEntry& e : log_) encode_record(e, buf);
+  if (wal_fd_ >= 0) ::close(wal_fd_);
+  write_file_atomically(kWalFile, buf);
+  const auto path = dir_ / kWalFile;
+  wal_fd_ = ::open(path.c_str(), O_RDWR | O_APPEND);
+  if (wal_fd_ < 0) die("open", path);
 }
 
 void FileStorage::append(const std::vector<LogEntry>& entries) {
@@ -248,18 +319,19 @@ void FileStorage::append(const std::vector<LogEntry>& entries) {
 }
 
 void FileStorage::truncate_from(Index i) {
-  assert(i >= 1);
+  assert(i > snap_.index);
   if (i > last_index()) return;
 
-  // Entry i starts right after the records of entries 1..i-1.
+  // The WAL holds exactly log_, so entry i starts right after the records of
+  // the entries before it.
   uint64_t offset = 0;
-  for (Index k = 1; k < i; ++k) offset += record_size(log_[k - 1]);
+  for (std::size_t k = 0; k < pos(i); ++k) offset += record_size(log_[k]);
 
   if (::ftruncate(wal_fd_, static_cast<off_t>(offset)) != 0) {
     die("ftruncate", dir_ / kWalFile);
   }
   sync_file(wal_fd_);
-  log_.resize(i - 1);
+  log_.resize(pos(i));
 }
 
 // ===========================================================================
@@ -267,14 +339,14 @@ void FileStorage::truncate_from(Index i) {
 // ===========================================================================
 
 Term FileStorage::term_at(Index i) const {
-  assert(i <= last_index());
-  return i == 0 ? 0 : log_[i - 1].term;
+  assert(snap_.index <= i && i <= last_index());
+  return i == snap_.index ? snap_.term : log_[pos(i)].term;
 }
 
 std::vector<LogEntry> FileStorage::entries(Index lo, Index hi) const {
-  assert(1 <= lo && lo <= hi && hi <= last_index() + 1);
-  return {log_.begin() + static_cast<long>(lo - 1),
-          log_.begin() + static_cast<long>(hi - 1)};
+  assert(snap_.index < lo && lo <= hi && hi <= last_index() + 1);
+  return {log_.begin() + static_cast<long>(pos(lo)),
+          log_.begin() + static_cast<long>(pos(hi))};
 }
 
 // ===========================================================================

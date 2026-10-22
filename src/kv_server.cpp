@@ -68,9 +68,22 @@ void KvServer::handle(const KvRequest& req, ReplyFn reply) {
 
 std::vector<rafty::LogEntry> KvServer::process() {
   std::vector<rafty::LogEntry> applied;
+  // A snapshot to load (on startup, or installed from the leader) replaces
+  // the state machine before any further entry is applied.
+  if (auto snap = raft_.take_snapshot_to_restore()) {
+    sm_.restore(snap->data);
+    last_snapshot_ = snap->index;
+  }
+
   // Order matters: apply first, so writes that DID commit are answered Ok
   // even if we lost leadership in the same moment.
   apply_committed(applied);
+
+  // Log compaction: every snapshot_every_ entries, hand Raft our state.
+  if (sm_.last_applied() >= last_snapshot_ + snapshot_every_) {
+    raft_.compact(sm_.last_applied(), sm_.serialize());
+    last_snapshot_ = sm_.last_applied();
+  }
   collect_reads();
   answer_ready_reads();
   if (raft_.role() != rafty::Role::Leader) fail_everything();

@@ -130,6 +130,53 @@ ApplyResult StateMachine::apply(const rafty::LogEntry& e) {
   return res;
 }
 
+// ===========================================================================
+// Snapshots
+// ===========================================================================
+
+// Layout: [u64 last_applied]
+//         [u32 n] n x ([u32 len][key][u32 len][value])
+//         [u32 m] m x ([u64 client_id][u64 last_seq])
+// std::map iterates in key order, so every node produces identical bytes.
+std::string StateMachine::serialize() const {
+  std::string out;
+  put_u64(out, last_applied_);
+  put_u32(out, static_cast<uint32_t>(data_.size()));
+  for (const auto& [k, v] : data_) {
+    put_u32(out, static_cast<uint32_t>(k.size()));
+    out += k;
+    put_u32(out, static_cast<uint32_t>(v.size()));
+    out += v;
+  }
+  put_u32(out, static_cast<uint32_t>(last_seq_.size()));
+  for (const auto& [client, seq] : last_seq_) {
+    put_u64(out, client);
+    put_u64(out, seq);
+  }
+  return out;
+}
+
+void StateMachine::restore(const std::string& bytes) {
+  Reader r{bytes};
+  StateMachine fresh;
+  fresh.last_applied_ = r.uint(8);
+  for (uint64_t n = r.uint(4); n > 0 && r.ok; --n) {
+    std::string k = r.str();
+    fresh.data_[std::move(k)] = r.str();
+  }
+  for (uint64_t n = r.uint(4); n > 0 && r.ok; --n) {
+    const uint64_t client = r.uint(8);
+    fresh.last_seq_[client] = r.uint(8);
+  }
+  // Snapshots come from our own serialize() and are CRC-checked on disk, so
+  // a bad one is a bug: stop rather than run with a half-loaded state.
+  if (!r.ok || r.pos != bytes.size()) {
+    std::fprintf(stderr, "FATAL: corrupt state machine snapshot\n");
+    std::abort();
+  }
+  *this = std::move(fresh);
+}
+
 std::optional<std::string> StateMachine::get(const std::string& key) const {
   auto it = data_.find(key);
   if (it == data_.end()) return std::nullopt;

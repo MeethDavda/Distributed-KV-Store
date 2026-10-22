@@ -61,20 +61,22 @@ class Storage {
 
   // ---- Log ----
   //
-  // The log is a contiguous run of entries with indices 1..last_index().
-  // Writes are durable on return, so a follower can acknowledge entries
-  // right after append() (invariant: durable before ack, or a "committed"
-  // entry could vanish in a crash).
+  // The log is a snapshot (covering indices 1..S, S = snapshot().index, 0 if
+  // none) followed by a contiguous run of entries S+1..last_index(). Writes
+  // are durable on return, so a follower can acknowledge entries right after
+  // append() (invariant: durable before ack, or a "committed" entry could
+  // vanish in a crash).
 
-  // Index of the last entry, or 0 if the log is empty.
+  // Index of the last entry (or of the snapshot, if no entries follow it).
   virtual Index last_index() const = 0;
 
-  // Term of the entry at index i. term_at(0) is 0 (the empty prefix).
-  // Precondition: i <= last_index().
+  // Term of the entry at index i. term_at(S) is the snapshot's term, and
+  // term_at(0) is 0, so the consistency check works at the boundary (S4).
+  // Precondition: S <= i <= last_index().
   virtual Term term_at(Index i) const = 0;
 
-  // Entries with indices in [lo, hi). Precondition: 1 <= lo <= hi <=
-  // last_index() + 1.
+  // Entries with indices in [lo, hi). Precondition: S < lo <= hi <=
+  // last_index() + 1 (compacted entries are gone).
   virtual std::vector<LogEntry> entries(Index lo, Index hi) const = 0;
 
   // Appends entries to the end. Precondition: they are consecutive and the
@@ -84,7 +86,21 @@ class Storage {
   // Deletes every entry with index >= i. Only followers call this, and only
   // when an incoming entry conflicts with ours (same index, different term).
   // Leaders never truncate their own log (Leader Append-Only).
+  // Precondition: i > S (snapshotted entries are committed, never conflict).
   virtual void truncate_from(Index i) = 0;
+
+  // ---- Snapshot ----
+
+  // The current snapshot (index 0 if there is none).
+  virtual const Snapshot& snapshot() const = 0;
+
+  // Stores `s` durably, then drops log entries covered by it (S3: snapshot
+  // first, delete second). Precondition: s.index > snapshot().index.
+  //   - If our log has the entry at s.index with term s.term, it is the same
+  //     history: entries after s.index are kept (normal compaction).
+  //   - Otherwise (an InstallSnapshot from the leader that our log does not
+  //     match) the whole log is discarded; the leader resends what follows.
+  virtual void save_snapshot(const Snapshot& s) = 0;
 };
 
 // In-memory Storage for tests.
@@ -105,17 +121,17 @@ class MemStorage final : public Storage {
 
   HardState load_hard_state() const override { return hard_state_; }
 
-  Index last_index() const override { return log_.size(); }
+  Index last_index() const override { return snap_.index + log_.size(); }
 
   Term term_at(Index i) const override {
-    assert(i <= last_index());
-    return i == 0 ? 0 : log_[i - 1].term;
+    assert(snap_.index <= i && i <= last_index());
+    return i == snap_.index ? snap_.term : log_[pos(i)].term;
   }
 
   std::vector<LogEntry> entries(Index lo, Index hi) const override {
-    assert(1 <= lo && lo <= hi && hi <= last_index() + 1);
-    return {log_.begin() + static_cast<long>(lo - 1),
-            log_.begin() + static_cast<long>(hi - 1)};
+    assert(snap_.index < lo && lo <= hi && hi <= last_index() + 1);
+    return {log_.begin() + static_cast<long>(pos(lo)),
+            log_.begin() + static_cast<long>(pos(hi))};
   }
 
   void append(const std::vector<LogEntry>& entries) override {
@@ -126,8 +142,21 @@ class MemStorage final : public Storage {
   }
 
   void truncate_from(Index i) override {
-    assert(i >= 1);
-    if (i <= last_index()) log_.resize(i - 1);
+    assert(i > snap_.index);
+    if (i <= last_index()) log_.resize(pos(i));
+  }
+
+  const Snapshot& snapshot() const override { return snap_; }
+
+  void save_snapshot(const Snapshot& s) override {
+    assert(s.index > snap_.index);
+    const bool same_history = s.index <= last_index() && term_at(s.index) == s.term;
+    if (same_history) {
+      log_.erase(log_.begin(), log_.begin() + static_cast<long>(pos(s.index) + 1));
+    } else {
+      log_.clear();
+    }
+    snap_ = s;
   }
 
   // Test hook: lets unit tests assert that a vote was persisted before the
@@ -135,8 +164,12 @@ class MemStorage final : public Storage {
   int save_count() const { return save_count_; }
 
  private:
+  // Position of index i in log_ (entries start right after the snapshot).
+  std::size_t pos(Index i) const { return i - snap_.index - 1; }
+
   HardState hard_state_;
-  std::vector<LogEntry> log_;  // log_[i - 1] holds index i
+  Snapshot snap_;
+  std::vector<LogEntry> log_;  // log_[pos(i)] holds index i
   int save_count_ = 0;
 };
 
@@ -161,7 +194,13 @@ class MemStorage final : public Storage {
 // fsync can falsely "succeed" because the kernel may have dropped the data
 // (PostgreSQL's fsyncgate), so crash and recover from the log instead.
 //
-// The log is also kept in memory for reads; snapshots (step 5) bound it.
+// Snapshots ("snapshot" file, written with the same temp + rename trick):
+// save_snapshot() writes the snapshot file FIRST, then rewrites the WAL
+// without the covered entries (S3). A crash in between leaves the new
+// snapshot next to the old WAL; recovery skips WAL records the snapshot
+// already covers, so nothing is lost or applied twice.
+//
+// The log is also kept in memory for reads; snapshots bound its size.
 class FileStorage final : public Storage {
  public:
   // Opens (or creates) `dir` and runs recovery.
@@ -174,28 +213,37 @@ class FileStorage final : public Storage {
   void save_hard_state(const HardState& hs) override;
   HardState load_hard_state() const override { return hs_; }
 
-  Index last_index() const override { return log_.size(); }
+  Index last_index() const override { return snap_.index + log_.size(); }
   Term term_at(Index i) const override;
   std::vector<LogEntry> entries(Index lo, Index hi) const override;
   void append(const std::vector<LogEntry>& entries) override;
   void truncate_from(Index i) override;
 
+  const Snapshot& snapshot() const override { return snap_; }
+  void save_snapshot(const Snapshot& s) override;
+
   // File names inside `dir`, exposed so tests can damage them on purpose.
   static constexpr const char* kWalFile = "wal";
   static constexpr const char* kHardStateFile = "hardstate";
+  static constexpr const char* kSnapshotFile = "snapshot";
 
  private:
   void load_hard_state_file();
+  void load_snapshot_file();
   void replay_wal();
+  void rewrite_wal();  // atomically replace the WAL with exactly log_
+  void write_file_atomically(const char* name, const std::string& bytes);
   void sync_file(int fd) const;
   void sync_dir() const;
+  std::size_t pos(Index i) const { return i - snap_.index - 1; }
 
   std::filesystem::path dir_;
   FsyncMode mode_;
   int wal_fd_ = -1;
 
   HardState hs_;
-  std::vector<LogEntry> log_;  // log_[i - 1] holds index i
+  Snapshot snap_;
+  std::vector<LogEntry> log_;  // log_[pos(i)] holds index i
 };
 
 // CRC-32 (IEEE 802.3 polynomial, as used by zlib/PNG). Exposed for tests.

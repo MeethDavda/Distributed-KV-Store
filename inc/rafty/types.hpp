@@ -110,9 +110,40 @@ struct AppendEntriesResp {
   uint64_t read_round = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Snapshots (log compaction)
+//
+// A snapshot replaces every log entry up to and including `index` with the
+// state machine's serialized state at that point. `term` is the term of the
+// entry at `index`, kept so the AppendEntries consistency check and the vote
+// check still work at the snapshot boundary.
+// ---------------------------------------------------------------------------
+struct Snapshot {
+  Index index = 0;  // 0 = no snapshot
+  Term term = 0;
+  std::string data{};  // opaque to Raft (KV map + dedup table)
+
+  bool operator==(const Snapshot&) const = default;
+};
+
+// Sent by the leader instead of AppendEntries when the follower needs entries
+// the leader has already compacted away. The whole snapshot goes in one
+// message (no chunking; fine for this project's state sizes).
+struct InstallSnapshotReq {
+  Term term = 0;
+  NodeId leader_id = kNoNode;
+  Snapshot snapshot{};
+};
+
+struct InstallSnapshotResp {
+  Term term = 0;
+  Index match_index = 0;  // follower now matches the leader up to here
+};
+
 // Envelope used by Transport. `from`/`to` live here, not in every payload.
 using Payload = std::variant<RequestVoteReq, RequestVoteResp, AppendEntriesReq,
-                             AppendEntriesResp>;
+                             AppendEntriesResp, InstallSnapshotReq,
+                             InstallSnapshotResp>;
 
 struct Message {
   NodeId from = kNoNode;

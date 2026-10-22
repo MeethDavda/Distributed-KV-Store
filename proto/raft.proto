@@ -59,6 +59,19 @@ message AppendEntriesResp {
   uint64 read_round = 6;
 }
 
+message InstallSnapshotReq {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 snapshot_index = 3;
+  uint64 snapshot_term = 4;
+  bytes snapshot_data = 5;  // whole snapshot in one message (no chunking)
+}
+
+message InstallSnapshotResp {
+  uint64 term = 1;
+  uint64 match_index = 2;
+}
+
 // The envelope: exactly one payload, like rafty::Payload (a std::variant).
 message RaftMessage {
   uint64 from = 1;
@@ -68,6 +81,8 @@ message RaftMessage {
     RequestVoteResp request_vote_resp = 4;
     AppendEntriesReq append_entries = 5;
     AppendEntriesResp append_entries_resp = 6;
+    InstallSnapshotReq install_snapshot = 7;
+    InstallSnapshotResp install_snapshot_resp = 8;
   }
 }
 

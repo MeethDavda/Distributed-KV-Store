@@ -154,6 +154,31 @@ TEST_F(StateMachineTest, DuplicateStillAdvancesLastApplied) {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshots (S2)
+// ---------------------------------------------------------------------------
+
+TEST_F(StateMachineTest, SnapshotRoundTripKeepsDataAndDedupTable) {
+  apply(cmd(OpType::Put, 1, 1, "x", "a"));
+  apply(cmd(OpType::Append, 2, 1, "y", "b"));
+  apply_noop();
+
+  StateMachine restored;
+  restored.restore(sm.serialize());
+  EXPECT_EQ(restored.data(), sm.data());
+  EXPECT_EQ(restored.last_seq(), sm.last_seq());
+  EXPECT_EQ(restored.last_applied(), 3u);
+
+  // Exactly-once survives compaction: a retry of client 2's write, arriving
+  // after the snapshot was loaded, is still recognised as a duplicate.
+  LogEntry retry;
+  retry.term = 1;
+  retry.index = 4;
+  retry.data = kv::encode(cmd(OpType::Append, 2, 1, "y", "b"));
+  EXPECT_TRUE(restored.apply(retry).duplicate);
+  EXPECT_EQ(restored.get("y"), "b");
+}
+
+// ---------------------------------------------------------------------------
 // Determinism (K1)
 // ---------------------------------------------------------------------------
 

@@ -93,6 +93,16 @@ class Raft {
   };
   std::vector<ReadState> take_reads();
 
+  // ---- Snapshots ----
+
+  // Called by the state machine owner after applying up to `index`: stores
+  // `data` (the state at `index`) as the snapshot and drops older log entries.
+  void compact(Index index, std::string data);
+
+  // A snapshot the state machine must load before applying further entries:
+  // on startup (if one exists) and after installing one from the leader.
+  std::optional<Snapshot> take_snapshot_to_restore();
+
   // Read-only accessors for drivers and tests.
   NodeId id() const { return cfg_.id; }
   Role role() const { return role_; }
@@ -122,6 +132,9 @@ class Raft {
   void handle_request_vote_resp(NodeId from, const RequestVoteResp& resp);
   void handle_append_entries(NodeId from, const AppendEntriesReq& req);
   void handle_append_entries_resp(NodeId from, const AppendEntriesResp& resp);
+  void handle_install_snapshot(NodeId from, const InstallSnapshotReq& req);
+  void handle_install_snapshot_resp(NodeId from,
+                                    const InstallSnapshotResp& resp);
 
   // ---- replication ----
   void send_append(NodeId peer);   // entries from progress_[peer].next
@@ -165,6 +178,7 @@ class Raft {
 
   Index commit_index_ = 0;  // highest index known committed; never decreases
   Index last_applied_ = 0;  // highest index handed out by take_committed()
+  bool restore_pending_ = false;  // state machine must load the snapshot
 
   Millis election_deadline_{0};       // follower/candidate: start election
   Millis next_heartbeat_{0};          // leader: send heartbeats

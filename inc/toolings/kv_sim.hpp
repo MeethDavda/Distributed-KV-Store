@@ -138,7 +138,10 @@ class KvSim final : public kv::ClientTransport {
   // machine starts empty and is rebuilt as committed entries are re-applied.
   kv::KvServer& server(NodeId id) {
     auto& s = servers_[id];
-    if (!s) s = std::make_unique<kv::KvServer>(*cluster_.mutable_node(id));
+    // A small snapshot interval, so every KV test and chaos run also
+    // exercises compaction, restore, and InstallSnapshot.
+    if (!s) s = std::make_unique<kv::KvServer>(*cluster_.mutable_node(id),
+                                               kSnapshotEvery);
     return *s;
   }
 
@@ -168,6 +171,8 @@ class KvSim final : public kv::ClientTransport {
       client(static_cast<int>(q.client_id)).on_response(q.server, q.resp);
     }
   }
+
+  static constexpr rafty::Index kSnapshotEvery = 20;
 
   SimCluster cluster_;  // first: servers and clients refer into it
   std::mt19937_64 rng_;

@@ -251,10 +251,20 @@ TEST_F(FileStorageTest, BehavesLikeMemStorageUnderRandomOperations) {
           store->append(batch);
           break;
         }
-        case 4: case 5: {  // truncate somewhere (possibly past the end)
-          const Index i = 1 + rng() % (mem.last_index() + 1);
+        case 4: case 5: {  // truncate after the snapshot (possibly past end)
+          const Index snap = mem.snapshot().index;
+          const Index i = snap + 1 + rng() % (mem.last_index() - snap + 1);
           mem.truncate_from(i);
           store->truncate_from(i);
+          break;
+        }
+        case 7: {  // compact: snapshot up to a random existing entry
+          const Index snap = mem.snapshot().index;
+          if (mem.last_index() == snap) break;
+          const Index i = snap + 1 + rng() % (mem.last_index() - snap);
+          const rafty::Snapshot s{i, mem.term_at(i), "state@" + std::to_string(i)};
+          mem.save_snapshot(s);
+          store->save_snapshot(s);
           break;
         }
         case 6: {  // new term + vote
@@ -272,13 +282,59 @@ TEST_F(FileStorageTest, BehavesLikeMemStorageUnderRandomOperations) {
 
       ASSERT_EQ(store->load_hard_state(), mem.load_hard_state()) << "op " << op;
       ASSERT_EQ(store->last_index(), mem.last_index()) << "op " << op;
-      if (mem.last_index() > 0) {
-        ASSERT_EQ(store->entries(1, mem.last_index() + 1),
-                  mem.entries(1, mem.last_index() + 1))
-            << "op " << op;
-      }
+      ASSERT_EQ(store->snapshot(), mem.snapshot()) << "op " << op;
+      const Index first = mem.snapshot().index + 1;
+      ASSERT_EQ(store->entries(first, mem.last_index() + 1),
+                mem.entries(first, mem.last_index() + 1))
+          << "op " << op;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
+
+TEST_F(FileStorageTest, SnapshotSurvivesRestartAndKeepsLaterEntries) {
+  reopen().append({entry(1, 1), entry(1, 2), entry(1, 3), entry(2, 4, "d"),
+                   entry(2, 5, "e")});
+  store->save_snapshot(rafty::Snapshot{3, 1, "state"});
+
+  auto& s = reopen();
+  EXPECT_EQ(s.snapshot(), (rafty::Snapshot{3, 1, "state"}));
+  EXPECT_EQ(s.last_index(), 5u);
+  EXPECT_EQ(s.term_at(3), 1u);  // boundary term comes from the snapshot
+  EXPECT_EQ(s.entries(4, 6),
+            (std::vector<LogEntry>{entry(2, 4, "d"), entry(2, 5, "e")}));
+}
+
+TEST_F(FileStorageTest, SnapshotNotMatchingLogReplacesWholeLog) {
+  // InstallSnapshot from a leader: our short log does not reach index 5.
+  reopen().append({entry(1, 1), entry(1, 2)});
+  store->save_snapshot(rafty::Snapshot{5, 2, "leader state"});
+  auto& s = reopen();
+  EXPECT_EQ(s.last_index(), 5u);
+  EXPECT_EQ(s.term_at(5), 2u);
+}
+
+TEST_F(FileStorageTest, CrashBetweenSnapshotAndWalRewriteLosesNothing) {
+  reopen().append({entry(1, 1), entry(1, 2), entry(1, 3), entry(1, 4, "d"),
+                   entry(1, 5, "e")});
+  store.reset();
+  const std::string old_wal = read_bytes(wal());
+
+  // Take the snapshot, then put the old WAL back: as if we crashed after the
+  // snapshot file was written but before the WAL was rewritten.
+  reopen().save_snapshot(rafty::Snapshot{3, 1, "state"});
+  store.reset();
+  write_bytes(wal(), old_wal);
+
+  auto& s = reopen();
+  EXPECT_EQ(s.snapshot().index, 3u);
+  ASSERT_EQ(s.last_index(), 5u);  // entries 4..5 kept, 1..3 skipped
+  EXPECT_EQ(s.entries(4, 6)[1].data, "e");
+  s.append({entry(1, 6, "f")});    // the WAL was cleaned up: appends work
+  EXPECT_EQ(reopen().last_index(), 6u);
 }
 
 }  // namespace

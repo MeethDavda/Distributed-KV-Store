@@ -86,7 +86,8 @@ add_library(proto_gen
   proto/raft.proto
   proto/kv.proto)
 target_link_libraries(proto_gen PUBLIC protobuf::libprotobuf gRPC::grpc++)
-target_include_directories(proto_gen PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+# SYSTEM: our strict warnings must not fire on generated headers we include.
+target_include_directories(proto_gen SYSTEM PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 protobuf_generate(TARGET proto_gen LANGUAGE cpp
   IMPORT_DIRS ${CMAKE_SOURCE_DIR}/proto)
 protobuf_generate(TARGET proto_gen LANGUAGE grpc
@@ -95,9 +96,46 @@ protobuf_generate(TARGET proto_gen LANGUAGE grpc
   IMPORT_DIRS ${CMAKE_SOURCE_DIR}/proto)
 # Generated code is not ours: no raft_kv_warnings on this target.
 
-# Test tooling (FakeClock, SimNetwork, SimCluster). Header-only.
-add_library(toolings INTERFACE)
-target_link_libraries(toolings INTERFACE rafty)
+# ASan + Homebrew protobuf: abseil (which protobuf uses) changes the memory
+# layout of some internal types when compiled under ASan. The prebuilt
+# protobuf/abseil libraries were built WITHOUT ASan, so ASan-compiled code
+# that includes their headers disagrees with them about object layout and
+# crashes inside libprotobuf. Fix: compile everything that includes protobuf
+# headers without ASan. That is only glue (generated code, converter, gRPC
+# wiring); rafty, kv, and the simulator stay fully ASan-checked.
+# (TSan does not change those layouts, so it needs no exception.)
+set(NO_ASAN_FOR_PROTOBUF "")
+if(SANITIZE STREQUAL "address")
+  set(NO_ASAN_FOR_PROTOBUF -fno-sanitize=address)
+endif()
+target_compile_options(proto_gen PRIVATE ${NO_ASAN_FOR_PROTOBUF})
+
+# The network edge: struct <-> proto conversion (and, next, the gRPC
+# transport). The only library besides proto_gen that sees protobuf.
+add_library(net
+  src/net/convert.cpp
+  src/net/grpc_transport.cpp
+  src/net/kv_node.cpp)
+target_link_libraries(net PUBLIC kv proto_gen PRIVATE raft_kv_warnings)
+target_compile_options(net PRIVATE ${NO_ASAN_FOR_PROTOBUF})
+
+# ---------------------------------------------------------------------------
+# Apps (built into build/app/)
+# ---------------------------------------------------------------------------
+add_executable(kv_node app/kv_node.cpp)
+target_link_libraries(kv_node PRIVATE net raft_kv_warnings)
+add_executable(kv_cli app/kv_cli.cpp)
+target_link_libraries(kv_cli PRIVATE net raft_kv_warnings)
+set_target_properties(kv_node kv_cli PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/app)
+target_compile_options(kv_node PRIVATE ${NO_ASAN_FOR_PROTOBUF})
+target_compile_options(kv_cli PRIVATE ${NO_ASAN_FOR_PROTOBUF})
+
+# Test tooling (FakeClock, SimNetwork, SimCluster) plus the linearizability
+# checker.
+add_library(toolings
+  src/lin_checker.cpp)
+target_link_libraries(toolings PUBLIC rafty PRIVATE raft_kv_warnings)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -112,11 +150,17 @@ add_executable(unit_tests
   unittests/raft_log_test.cpp
   unittests/raft_read_test.cpp
   unittests/storage_test.cpp
-  unittests/state_machine_test.cpp)
-# toolings and kv already bring in rafty; listing it too makes Apple ld warn
+  unittests/state_machine_test.cpp
+  unittests/msg_queue_test.cpp
+  unittests/convert_test.cpp
+  unittests/lin_checker_test.cpp)
+# toolings and net (via kv) already bring in rafty; listing it too makes Apple ld warn
 # about duplicate libraries.
-target_link_libraries(unit_tests PRIVATE toolings kv GTest::gtest_main
+target_link_libraries(unit_tests PRIVATE toolings net GTest::gtest_main
                                          raft_kv_warnings)
+# The only unit test file that includes protobuf headers (see proto_gen note).
+set_source_files_properties(unittests/convert_test.cpp PROPERTIES
+  COMPILE_OPTIONS "${NO_ASAN_FOR_PROTOBUF}")
 gtest_discover_tests(unit_tests)
 
 # Integration tests: whole clusters on the simulated network.

@@ -56,7 +56,9 @@ using ReplyFn = std::function<void(const KvResponse&)>;
 
 class KvServer {
  public:
-  explicit KvServer(rafty::Raft& raft) : raft_(raft) {}
+  // Takes a snapshot (log compaction) every `snapshot_every` applied entries.
+  explicit KvServer(rafty::Raft& raft, rafty::Index snapshot_every = 1000)
+      : raft_(raft), snapshot_every_(snapshot_every) {}
 
   // Accepts one client request. The reply is sent later (from process()),
   // or immediately if this node is not the leader.
@@ -90,6 +92,8 @@ class KvServer {
   KvResponse not_leader(uint64_t seq) const;
 
   rafty::Raft& raft_;
+  rafty::Index snapshot_every_;
+  rafty::Index last_snapshot_ = 0;
   StateMachine sm_;
   std::map<rafty::Index, PendingWrite> pending_writes_;  // by log index
   std::map<uint64_t, PendingRead> pending_reads_;        // by read id

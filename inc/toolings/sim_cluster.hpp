@@ -286,12 +286,12 @@ class SimCluster {
       if (!r) continue;
       for (LogEntry& e : drain_ ? drain_(id, *r) : r->take_committed()) {
         auto& mine = applied_[id];
-        // Entries must be applied exactly once each, in index order.
-        const Index expected = mine.empty() ? 1 : mine.back().index + 1;
-        if (e.index != expected) {
+        // Entries are applied in increasing index order, never twice. (Not
+        // necessarily +1: loading a snapshot legitimately skips ahead.)
+        if (!mine.empty() && e.index <= mine.back().index) {
           fail("node " + std::to_string(id) + " applied index " +
-               std::to_string(e.index) + ", expected " +
-               std::to_string(expected));
+               std::to_string(e.index) + " after " +
+               std::to_string(mine.back().index));
         }
         // State Machine Safety: everyone applies the same entry at an index.
         auto [it, first] = committed_.try_emplace(e.index, e);
@@ -349,6 +349,7 @@ class SimCluster {
   void check_leader_completeness(NodeId id) {
     const Storage& s = *storage_[id];
     for (const auto& [idx, e] : committed_) {
+      if (idx <= s.snapshot().index) continue;  // inside its snapshot
       if (idx > s.last_index() || s.term_at(idx) != e.term) {
         fail("leader completeness: new leader " + std::to_string(id) +
              " is missing committed index " + std::to_string(idx));
@@ -367,10 +368,12 @@ class SimCluster {
         if (!storage_[ids_[a]] || !storage_[ids_[b]]) continue;
         const Storage& sa = *storage_[ids_[a]];
         const Storage& sb = *storage_[ids_[b]];
+        // Compare only entries both logs still hold (after both snapshots).
+        const Index lo = std::max(sa.snapshot().index, sb.snapshot().index);
         Index i = std::min(sa.last_index(), sb.last_index());
-        while (i > 0 && sa.term_at(i) != sb.term_at(i)) --i;
-        if (i == 0) continue;
-        if (sa.entries(1, i + 1) != sb.entries(1, i + 1)) {
+        while (i > lo && sa.term_at(i) != sb.term_at(i)) --i;
+        if (i <= lo) continue;
+        if (sa.entries(lo + 1, i + 1) != sb.entries(lo + 1, i + 1)) {
           fail("log matching: nodes " + std::to_string(ids_[a]) + " and " +
                std::to_string(ids_[b]) + " agree on index " +
                std::to_string(i) + " but differ before it");

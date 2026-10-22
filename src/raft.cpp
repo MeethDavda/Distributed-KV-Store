@@ -54,6 +54,10 @@ Raft::Raft(Config cfg, Transport& transport, Storage& storage,
   // 0: the state machine is rebuilt by re-applying committed entries as the
   // leader re-announces its commit index.
   hs_ = storage_.load_hard_state();
+  // A snapshot only ever covers committed, applied entries, so both indices
+  // start there; the state machine loads the snapshot first.
+  commit_index_ = last_applied_ = storage_.snapshot().index;
+  restore_pending_ = commit_index_ > 0;
   // Every node starts as a follower, even one that was leader before a crash.
   become_follower(hs_.current_term, kNoNode);
 }
@@ -101,6 +105,12 @@ void Raft::step(const Message& msg) {
           [&](const AppendEntriesResp& m) {
             handle_append_entries_resp(msg.from, m);
           },
+          [&](const InstallSnapshotReq& m) {
+            handle_install_snapshot(msg.from, m);
+          },
+          [&](const InstallSnapshotResp& m) {
+            handle_install_snapshot_resp(msg.from, m);
+          },
       },
       msg.payload);
 }
@@ -128,6 +138,18 @@ bool Raft::read_index(uint64_t id) {
   pending_reads_.push_back(PendingRead{id, 0, 0});
   start_pending_reads();
   return true;
+}
+
+void Raft::compact(Index index, std::string data) {
+  // S1: only applied (so committed) state may be snapshotted.
+  if (index <= storage_.snapshot().index || index > last_applied_) return;
+  storage_.save_snapshot(Snapshot{index, storage_.term_at(index), std::move(data)});
+}
+
+std::optional<Snapshot> Raft::take_snapshot_to_restore() {
+  if (!restore_pending_) return std::nullopt;
+  restore_pending_ = false;
+  return storage_.snapshot();
 }
 
 std::vector<Raft::ReadState> Raft::take_reads() {
@@ -335,6 +357,19 @@ void Raft::handle_append_entries(NodeId from, const AppendEntriesReq& req) {
   // this term lost the election; everyone resets their election timer.
   become_follower(req.term, from);
 
+  // The leader is probing below our snapshot (e.g. a delayed message). Those
+  // entries are committed and already in our snapshot, so just tell the
+  // leader we match up to the snapshot; it continues from there.
+  if (req.prev_log_index < storage_.snapshot().index) {
+    AppendEntriesResp ok;
+    ok.term = hs_.current_term;
+    ok.success = true;
+    ok.match_index = storage_.snapshot().index;
+    ok.read_round = req.read_round;
+    send(from, ok);
+    return;
+  }
+
   // Log Matching consistency check: we must hold the entry the new entries
   // follow. If not, reject; the leader will back up and retry.
   if (req.prev_log_index > last_log_index() ||
@@ -430,6 +465,37 @@ void Raft::handle_append_entries_resp(NodeId from,
   send_append(from);
 }
 
+void Raft::handle_install_snapshot(NodeId from, const InstallSnapshotReq& req) {
+  if (req.term < hs_.current_term) {  // term rule: stale leader
+    send(from, InstallSnapshotResp{hs_.current_term, 0});
+    return;
+  }
+  become_follower(req.term, from);
+
+  const Snapshot& s = req.snapshot;
+  // S5: never go backwards. If we already committed past it, just say so.
+  if (s.index > commit_index_) {
+    storage_.save_snapshot(s);  // durable before we ack
+    commit_index_ = last_applied_ = s.index;
+    restore_pending_ = true;  // the state machine reloads from it
+  }
+  send(from, InstallSnapshotResp{hs_.current_term, s.index});
+}
+
+void Raft::handle_install_snapshot_resp(NodeId from,
+                                        const InstallSnapshotResp& resp) {
+  if (resp.term > hs_.current_term) {
+    become_follower(resp.term, kNoNode);
+    return;
+  }
+  if (role_ != Role::Leader || resp.term != hs_.current_term) return;
+  last_ack_[from] = clock_.now();
+  Progress& p = progress_[from];
+  p.match = std::max(p.match, resp.match_index);
+  p.next = std::max(p.next, p.match + 1);
+  maybe_advance_commit();
+}
+
 // ===========================================================================
 // Replication helpers
 // ===========================================================================
@@ -448,6 +514,12 @@ void Raft::send_append(NodeId peer) {
   Progress& p = progress_[peer];
   const Index last = last_log_index();
   p.next = std::min(p.next, last + 1);
+
+  // The entries this follower needs were compacted away: send the snapshot.
+  if (p.next <= storage_.snapshot().index) {
+    send(peer, InstallSnapshotReq{hs_.current_term, cfg_.id, storage_.snapshot()});
+    return;
+  }
 
   AppendEntriesReq req;
   req.term = hs_.current_term;

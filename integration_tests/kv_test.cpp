@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "toolings/kv_sim.hpp"
+#include "toolings/lin_checker.hpp"
 
 namespace {
 
@@ -233,9 +234,11 @@ TEST(KvReads, DeposedLeaderNeverServesStaleRead) {
 // ---------------------------------------------------------------------------
 
 TEST(KvDurability, AcknowledgedWritesSurviveWholeClusterRestart) {
+  // 50 writes > the snapshot interval (20), so the restart loads snapshot
+  // files and replays only the log after them.
   KvSim kv(3, /*seed=*/37, /*clients=*/1, temp_dir("restart"));
   ASSERT_TRUE(wait_for_leader(kv));
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < 50; ++i) {
     ASSERT_TRUE(put(kv, 1, "k" + std::to_string(i), "v" + std::to_string(i)));
   }
 
@@ -243,10 +246,37 @@ TEST(KvDurability, AcknowledgedWritesSurviveWholeClusterRestart) {
   for (NodeId id : kv.cluster().ids()) kv.restart(id);
 
   ASSERT_TRUE(wait_for_leader(kv));
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < 50; ++i) {
     EXPECT_EQ(get(kv, 1, "k" + std::to_string(i)),
               std::optional<std::string>("v" + std::to_string(i)));
   }
+  EXPECT_NO_VIOLATIONS(kv);
+}
+
+TEST(KvSnapshots, FarBehindFollowerCatchesUpViaInstallSnapshot) {
+  KvSim kv(3, /*seed=*/38, /*clients=*/1);
+  ASSERT_TRUE(wait_for_leader(kv));
+  const NodeId leader = *kv.cluster().leader();
+  const NodeId f = kv.cluster().ids()[0] == leader ? kv.cluster().ids()[1]
+                                                   : kv.cluster().ids()[0];
+  kv.crash(f);
+
+  // 100 writes while it is down: the leader compacts its log several times,
+  // so the entries the follower is missing no longer exist as log entries.
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(put(kv, 1, "k" + std::to_string(i % 10), std::to_string(i)));
+  }
+  ASSERT_GT(kv.cluster().storage(*kv.cluster().leader()).snapshot().index, 0u);
+
+  kv.restart(f);
+  ASSERT_TRUE(kv.run_until(
+      [&] {
+        const auto* fs = kv.state(f);
+        const auto* ls = kv.state(*kv.cluster().leader());
+        return fs && ls && fs->data() == ls->data();
+      },
+      3s))
+      << "follower did not catch up";
   EXPECT_NO_VIOLATIONS(kv);
 }
 
@@ -292,21 +322,34 @@ void run_chaos(uint64_t seed) {
   };
 
   // Start a random operation on every idle client.
+  // Every operation's [call, return] interval, for the linearizability check.
+  std::vector<toolings::Operation> history;
+  auto now = [&] { return kv.cluster().clock().now().count(); };
+
   auto issue = [&] {
     for (int c = 1; c <= kClients; ++c) {
       KvClient& cl = kv.client(c);
       if (cl.busy()) continue;
       const std::string key = keys[rng() % keys.size()];
+      const std::size_t h = history.size();  // index: the vector may grow
       if (rng() % 4 == 0) {
+        history.push_back({static_cast<uint64_t>(c), toolings::OpKind::Get, key,
+                           "", false, now(), toolings::kNever});
         auto before = acked[key];  // must all be visible to this read
-        cl.get(key, [&, key, before](const KvResponse& r) {
+        cl.get(key, [&, key, before, h](const KvResponse& r) {
+          history[h].found = r.found;
+          history[h].value = r.value;
+          history[h].ret = now();
           check_read(key, r, before);
         });
       } else {
         const std::string tok =
             "c" + std::to_string(c) + "-" + std::to_string(next_token[c]++);
         proposed[key].insert(tok);
-        cl.append(key, tok + ";", [&, key, tok](const KvResponse&) {
+        history.push_back({static_cast<uint64_t>(c), toolings::OpKind::Append,
+                           key, tok + ";", false, now(), toolings::kNever});
+        cl.append(key, tok + ";", [&, key, tok, h](const KvResponse&) {
+          history[h].ret = now();
           acked[key].insert(tok);
         });
       }
@@ -390,6 +433,12 @@ void run_chaos(uint64_t seed) {
     }
   }
   EXPECT_GT(reads_checked, 0);
+
+  // The full check: is the whole recorded history linearizable?
+  const auto lin = toolings::check_linearizable(history);
+  EXPECT_EQ(lin.verdict, toolings::LinResult::Verdict::Ok)
+      << "key " << lin.key << " (" << history.size() << " ops):\n"
+      << lin.detail;
   EXPECT_NO_VIOLATIONS(kv);
 }
 

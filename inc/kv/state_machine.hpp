@@ -71,6 +71,12 @@ class StateMachine {
 
   rafty::Index last_applied() const { return last_applied_; }
 
+  // Snapshot support. serialize() captures the map, the dedup table (S2:
+  // exactly-once must survive compaction), and last_applied. restore()
+  // replaces the whole state with a serialized one.
+  std::string serialize() const;
+  void restore(const std::string& data);
+
   // Full state, for determinism tests (and snapshots in step 5).
   const std::map<std::string, std::string>& data() const { return data_; }
   const std::map<uint64_t, uint64_t>& last_seq() const { return last_seq_; }
