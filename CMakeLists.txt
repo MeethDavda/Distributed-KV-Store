@@ -137,10 +137,13 @@ add_executable(kv_node app/kv_node.cpp)
 target_link_libraries(kv_node PRIVATE net raft_kv_warnings)
 add_executable(kv_cli app/kv_cli.cpp)
 target_link_libraries(kv_cli PRIVATE net raft_kv_warnings)
-set_target_properties(kv_node kv_cli PROPERTIES
+add_executable(bench app/bench.cpp)
+target_link_libraries(bench PRIVATE net raft_kv_warnings)
+set_target_properties(kv_node kv_cli bench PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/app)
 target_compile_options(kv_node PRIVATE ${NO_ASAN_FOR_PROTOBUF})
 target_compile_options(kv_cli PRIVATE ${NO_ASAN_FOR_PROTOBUF})
+target_compile_options(bench PRIVATE ${NO_ASAN_FOR_PROTOBUF})
 
 # Test tooling (FakeClock, SimNetwork, SimCluster) plus the linearizability
 # checker.

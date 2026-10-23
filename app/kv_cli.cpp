@@ -5,9 +5,8 @@
 //
 // Uses the same KvClient as the simulator tests (leader hints, retries with
 // the same seq, so a retried write is applied once). The only new piece is
-// GrpcClientTransport below, which sends KvClient's requests over gRPC.
-
-#include <grpcpp/grpcpp.h>
+// GrpcClientTransport (net/grpc_client_transport.hpp), which sends KvClient's
+// requests over gRPC.
 
 #include <chrono>
 #include <cstdio>
@@ -22,9 +21,8 @@
 #include <utility>
 #include <vector>
 
-#include "kv.grpc.pb.h"
 #include "kv/kv_client.hpp"
-#include "net/convert.hpp"
+#include "net/grpc_client_transport.hpp"
 
 namespace {
 
@@ -36,36 +34,6 @@ constexpr rafty::Millis kAttemptTimeout{500};
 constexpr rafty::Millis kBackoff{50};
 // Give up on the whole operation after this long.
 constexpr auto kOverallLimit = 10s;
-
-// kv::ClientTransport over gRPC. send() does a blocking call (bounded by the
-// attempt timeout) and stores any reply in `inbox`; the main loop then hands
-// replies to KvClient::on_response(). No threads needed.
-class GrpcClientTransport final : public kv::ClientTransport {
- public:
-  explicit GrpcClientTransport(const std::map<rafty::NodeId, std::string>& addrs) {
-    for (const auto& [id, addr] : addrs) {
-      stubs_[id] = kvpb::KV::NewStub(
-          grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
-    }
-  }
-
-  void send(rafty::NodeId server, const kv::KvRequest& req) override {
-    auto it = stubs_.find(server);
-    if (it == stubs_.end()) return;
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + kAttemptTimeout);
-    kvpb::KvResponse resp;
-    // On failure (node down, deadline) there is no reply: KvClient's own
-    // timeout will move on to the next server.
-    if (!it->second->Execute(&ctx, net::to_proto(req), &resp).ok()) return;
-    if (auto r = net::from_proto(resp)) inbox.emplace_back(server, *r);
-  }
-
-  std::vector<std::pair<rafty::NodeId, kv::KvResponse>> inbox;
-
- private:
-  std::map<rafty::NodeId, std::unique_ptr<kvpb::KV::Stub>> stubs_;
-};
 
 [[noreturn]] void usage() {
   std::fprintf(stderr,
@@ -101,7 +69,7 @@ int main(int argc, char** argv) {
   std::vector<rafty::NodeId> servers;
   for (const auto& [id, addr] : addrs) servers.push_back(id);
 
-  GrpcClientTransport transport(addrs);
+  net::GrpcClientTransport transport(addrs, kAttemptTimeout);
   rafty::SteadyClock clock;
   // A fresh random 64-bit client id per invocation (seq starts at 1), so two
   // CLI runs never share a dedup entry.
@@ -128,9 +96,7 @@ int main(int argc, char** argv) {
   // Drive the client: deliver replies, let it retry, until done or give up.
   const auto give_up = std::chrono::steady_clock::now() + kOverallLimit;
   while (!result && std::chrono::steady_clock::now() < give_up) {
-    auto replies = std::exchange(transport.inbox, {});
-    for (const auto& [from, r] : replies) client.on_response(from, r);
-    client.tick();
+    transport.pump(client);
     if (!result) std::this_thread::sleep_for(5ms);
   }
 

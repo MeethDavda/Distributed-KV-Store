@@ -1,0 +1,16 @@
+{
+  "commit": "3858c07",
+  "date": "2026-10-22",
+  "hardware": "Apple M4 Pro, 12 cores, internal SSD, macOS 15.7.3",
+  "fsync_mode": "none",
+  "cluster_size": 3,
+  "workload": {
+    "read_pct": 50,
+    "value_bytes": 128,
+    "clients": 1,
+    "duration_s": 20
+  },
+  "throughput_ops_s": 3689,
+  "latency_ms": { "p50": 0.26625, "p95": 0.301083, "p99": 0.353667 },
+  "notes": "3 local processes on one machine, snapshot every 1000"
+}
