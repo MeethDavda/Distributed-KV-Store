@@ -270,14 +270,3 @@ bottleneck, average latency ≈ clients ÷ throughput:
 
 Requests simply queue at one bottleneck, which confirms the measurements.
 
-**Next optimizations:** group commit (one write + one flush for all proposals
-that arrive during a flush; the WAL already supports batch writes), moving the
-flush off the loop thread, batching ReadIndex rounds, and running nodes on
-separate machines.
-
-## Limitations
-
-- Fixed cluster membership (no adding or removing nodes at runtime).
-- Snapshots travel in one message (gRPC's default 4 MB limit caps state size).
-- No group commit or TLS yet.
-- Benchmarks come from a laptop; treat the numbers as relative.
